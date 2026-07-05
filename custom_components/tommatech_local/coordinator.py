@@ -92,9 +92,16 @@ class InverterCoordinator:
         import socket
 
         loop = asyncio.get_running_loop()
-        msg = f"set>server={_local_ip(self.host)}:{DEFAULT_TCP_PORT};".encode()
         while True:
             if not self.data["connected"]:
+                # Resolve our IP fresh each round: at HA boot after a power
+                # outage the network may not be up yet, and the address can
+                # legitimately change between outages.
+                ip = _local_ip(self.host)
+                if ip == "0.0.0.0":
+                    await asyncio.sleep(15)
+                    continue
+                msg = f"set>server={ip}:{DEFAULT_TCP_PORT};".encode()
                 try:
                     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
