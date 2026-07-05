@@ -1,0 +1,97 @@
+# ============================================================
+# Eyrie sun state — irradiance estimation from inverter signals
+#
+# Provides:
+#   sensor.pv_irradiance           — raw 0-100% estimate (jittery)
+#   sensor.pv_irradiance_smoothed  — 5-min moving average (use this)
+#   binary_sensor.pv_throttled     — diagnostic: MPPT capping
+#   binary_sensor.inverter_online  — connectivity flag
+# ============================================================
+
+template:
+  - sensor:
+      - name: "PV Irradiance"
+        unique_id: pv_irradiance_pct
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:weather-sunny
+        availability: >
+          {% set required = [
+            'sensor.tommatech_inverter_direct_pv_voltage',
+            'sensor.tommatech_inverter_direct_pv2_voltage',
+            'sensor.total_pv_power_w',
+            'sensor.tommatech_inverter_direct_battery_voltage',
+            'sensor.tommatech_inverter_direct_float_charging_voltage'
+          ] %}
+          {{ required | map('states') | reject('in', ['unknown', 'unavailable', 'none']) | list | length == required | length }}
+        state: >
+          {# Tunable constants — adjust if array changes #}
+          {% set NAMEPLATE = 5460 %}     {# 12 × 455W #}
+          {% set V_USABLE  = 150 %}      {# above standby plateau #}
+          {% set V_MPP     = 250 %}      {# 6S string Vmp #}
+          {% set V_OC      = 295 %}      {# 6S string Voc #}
+
+          {% set v1 = states('sensor.tommatech_inverter_direct_pv_voltage')|float(0) %}
+          {% set v2 = states('sensor.tommatech_inverter_direct_pv2_voltage')|float(0) %}
+          {% set v  = [v1, v2] | max %}
+          {% set p  = states('sensor.total_pv_power_w')|float(0) %}
+          {% set bv = states('sensor.tommatech_inverter_direct_battery_voltage')|float(0) %}
+          {% set fv = states('sensor.tommatech_inverter_direct_float_charging_voltage')|float(54.4) %}
+
+          {# Throttled if voltage clearly drifted above Vmp,
+             OR battery clamped (absorption or float) AND voltage at least at Vmp.
+             Voltage>=Vmp prevents false positive when demand exceeds supply
+             (panels loaded below Vmp during low irradiance bulk). #}
+          {% set throttled = (v > V_MPP + 20) or (bv >= fv - 0.5 and v >= V_MPP) %}
+          {% set pct_power = (p / NAMEPLATE * 100) | round(0) %}
+
+          {% if v < V_USABLE %}
+            0
+          {% elif throttled %}
+            {% set vf = [[(v - V_MPP) / (V_OC - V_MPP), 0]|max, 1]|min %}
+            {% set pct_volt = (30 + vf * 70) | round(0) %}
+            {{ [pct_power, pct_volt] | max }}
+          {% else %}
+            {{ pct_power }}
+          {% endif %}
+
+  - binary_sensor:
+      - name: "Inverter Online"
+        unique_id: inverter_online
+        device_class: connectivity
+        state: >
+          {% set s = states('sensor.tommatech_inverter_direct_battery_voltage') %}
+          {% if s in ['unknown', 'unavailable', 'none'] %}
+            false
+          {% else %}
+            {{ (now() - states.sensor.tommatech_inverter_direct_battery_voltage.last_reported).total_seconds() < 300 }}
+          {% endif %}
+        delay_off:
+          minutes: 1
+
+      - name: "PV Throttled"
+        unique_id: pv_throttled
+        icon: mdi:battery-charging-100
+        availability: >
+          {{ is_state('binary_sensor.inverter_online', 'on') }}
+        state: >
+          {% set V_MPP = 250 %}
+          {% set v1 = states('sensor.tommatech_inverter_direct_pv_voltage')|float(0) %}
+          {% set v2 = states('sensor.tommatech_inverter_direct_pv2_voltage')|float(0) %}
+          {% set v  = [v1, v2] | max %}
+          {% set bv = states('sensor.tommatech_inverter_direct_battery_voltage')|float(0) %}
+          {% set fv = states('sensor.tommatech_inverter_direct_float_charging_voltage')|float(54.4) %}
+          {{ (v > V_MPP + 20) or (bv >= fv - 0.5 and v >= V_MPP) }}
+
+# ------------------------------------------------------------
+# Smoothed irradiance — use this in dashboards and automations.
+# Filter platform is its own top-level domain, not under template.
+# ------------------------------------------------------------
+sensor:
+  - platform: filter
+    name: "PV Irradiance Smoothed"
+    entity_id: sensor.pv_irradiance
+    filters:
+      - filter: time_simple_moving_average
+        window_size: "00:05:00"
+        precision: 0

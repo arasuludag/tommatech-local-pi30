@@ -1,0 +1,31 @@
+# ==========================================================================
+# Battery temperature compensation for TommaTech inverter
+# Outdo OT200-12(GEL) 4S2P bank, importer-spec voltages with temp comp
+# Trigger: hourly, min 2h between writes, hysteresis ≥ 0.3 V (bulk) / 0.2 V (float)
+# ==========================================================================
+
+template:
+  - sensor:
+      - name: "Bulk Voltage Temp Compensated"
+        unique_id: bulk_voltage_temp_comp
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        state: >
+          {% set base = 57.6 %}
+          {% set coeff = -0.096 %}
+          {% set t_raw = states('sensor.battery_bank_temp') | float(25) %}
+          {% set t = [-10, [t_raw, 50] | min] | max %}
+          {{ [55.6, [base + coeff * (t - 25), 58.0] | min] | max | round(1) }}
+
+      - name: "Float Voltage Temp Compensated"
+        unique_id: float_voltage_temp_comp
+        unit_of_measurement: "V"
+        device_class: voltage
+        state_class: measurement
+        state: >
+          {% set base = 54.0 %}
+          {% set coeff = -0.072 %}
+          {% set t_raw = states('sensor.battery_bank_temp') | float(25) %}
+          {% set t = [-10, [t_raw, 50] | min] | max %}
+          {{ [53.2, [base + coeff * (t - 25), 54.4] | min] | max | round(1) }}
