@@ -1,0 +1,17 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tommatech Local Inverter",
+        "description": "Enter the WiFi collector dongle's IP address. Home Assistant will announce itself so the dongle connects locally instead of the cloud.",
+        "data": {
+          "host": "Collector dongle IP",
+          "devaddr": "RS485 device address (default 255)"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "This inverter is already configured."
+    }
+  }
+}
