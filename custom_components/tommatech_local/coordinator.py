@@ -33,6 +33,10 @@ _LOGGER = logging.getLogger(__name__)
 SIGNAL_UPDATE = f"{DOMAIN}_update"
 REQUEST_TIMEOUT = 6.0
 HEARTBEAT_EVERY = 50  # seconds; keeps the dongle owned by us
+# Hold last values through a brief collector drop (WiFi hiccup / re-dial)
+# instead of flipping every entity to unavailable. A genuine outage still
+# surfaces as unavailable once this window passes.
+AVAILABILITY_GRACE = 90  # seconds
 
 
 def _parse_fields(raw: str, field_map: dict[str, int]) -> dict[str, float]:
@@ -62,6 +66,16 @@ class InverterCoordinator:
         self._tasks: list[asyncio.Task] = []
         self._last_poll: dict[str, float] = {}
         self._startup_done = False
+        self._disconnected_at: float | None = None
+
+    def entities_available(self) -> bool:
+        """True while the link is up, or briefly after a drop so entities
+        ride out a transient collector reconnect on their last values."""
+        if self.data.get("connected"):
+            return True
+        if self._disconnected_at is None:
+            return False
+        return (time.monotonic() - self._disconnected_at) < AVAILABILITY_GRACE
 
     # -- lifecycle ----------------------------------------------------
     async def async_start(self) -> None:
@@ -94,6 +108,10 @@ class InverterCoordinator:
         loop = asyncio.get_running_loop()
         while True:
             if not self.data["connected"]:
+                # Updates are push-only, so nudge entities to re-check
+                # availability each round; once AVAILABILITY_GRACE passes
+                # they flip from "last value" to unavailable on their own.
+                async_dispatcher_send(self.hass, SIGNAL_UPDATE)
                 # Resolve our IP fresh each round: at HA boot after a power
                 # outage the network may not be up yet, and the address can
                 # legitimately change between outages.
@@ -124,6 +142,7 @@ class InverterCoordinator:
             self._writer.close()
         self._writer = writer
         self.data["connected"] = True
+        self._disconnected_at = None
         self._startup_done = False
         writer.write(build_heartbeat(self._next_tid(), HEARTBEAT_EVERY))
         await writer.drain()
@@ -137,6 +156,7 @@ class InverterCoordinator:
             poll_task.cancel()
             hb_task.cancel()
             self.data["connected"] = False
+            self._disconnected_at = time.monotonic()
             if self._writer is writer:
                 self._writer = None
             for fut in self._pending.values():

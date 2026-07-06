@@ -30,4 +30,4 @@ class InverterEntity(Entity):
 
     @property
     def available(self) -> bool:
-        return self.coordinator.data.get("connected", False)
+        return self.coordinator.entities_available()

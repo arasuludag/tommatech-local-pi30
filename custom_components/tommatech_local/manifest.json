@@ -1,10 +1,12 @@
 {
   "domain": "tommatech_local",
   "name": "Tommatech Local (PI30)",
-  "version": "0.1.1",
-  "documentation": "https://github.com/arasuludag/tommatech-local",
-  "issue_tracker": "https://github.com/arasuludag/tommatech-local/issues",
-  "codeowners": ["@arasuludag"],
+  "version": "0.1.2",
+  "documentation": "https://github.com/arasuludag/tommatech-local-pi30",
+  "issue_tracker": "https://github.com/arasuludag/tommatech-local-pi30/issues",
+  "codeowners": [
+    "@arasuludag"
+  ],
   "config_flow": true,
   "iot_class": "local_polling",
   "integration_type": "device",
