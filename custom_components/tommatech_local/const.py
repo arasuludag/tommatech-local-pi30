@@ -126,7 +126,16 @@ QPIWS_BITS = {
     29: "Battery too low to charge",
 }
 # Bits that indicate a normal condition for an off-grid site, not a problem.
+# Still shown in "Active Warnings" for context, but don't trip the Problem sensor.
 QPIWS_INFORMATIONAL = {5}
+
+# Bits this unit asserts persistently that are NOT real faults, and which we
+# drop before they reach any entity. The vendor DESS cloud reads the same raw
+# QPIWS and never reports these, and the inverter is fully functional (firmware
+# reads, QPIRI setpoint read-backs, and set commands all succeed — a genuine
+# EEPROM fault would break them). The true bit remains visible in the Problem
+# sensor's `raw_qpiws` attribute for diagnostics.
+QPIWS_SUPPRESSED = {17}  # "EEPROM fault" — chronic false positive on this PI30
 
 MODE_MAP = {
     "P": "Power on", "S": "Standby", "L": "Line", "B": "Battery",

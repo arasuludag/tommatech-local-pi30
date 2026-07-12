@@ -1,7 +1,7 @@
 {
   "domain": "tommatech_local",
   "name": "Tommatech Local (PI30)",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "documentation": "https://github.com/arasuludag/tommatech-local-pi30",
   "issue_tracker": "https://github.com/arasuludag/tommatech-local-pi30/issues",
   "codeowners": [

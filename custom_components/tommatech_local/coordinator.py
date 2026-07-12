@@ -21,7 +21,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .const import (
     DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, DEVICE_STATUS_BITS, DOMAIN,
     POLL_INTERVALS, QPIGS2_FIELDS, QPIGS_FIELDS, QPIRI_FIELDS,
-    QPIWS_BITS, QPIWS_INFORMATIONAL, STARTUP_COMMANDS,
+    QPIWS_BITS, QPIWS_INFORMATIONAL, QPIWS_SUPPRESSED, STARTUP_COMMANDS,
 )
 from .protocol import (
     HEADER, build_forward, build_heartbeat, build_q_command,
@@ -313,6 +313,8 @@ def _parse_status_bits(bit_str: str) -> dict[str, bool]:
 def _decode_warnings(bits: str) -> list[str]:
     active = []
     for idx, name in QPIWS_BITS.items():
+        if idx in QPIWS_SUPPRESSED:
+            continue  # known false positive on this unit; see const.py
         if idx < len(bits) and bits[idx] == "1":
             active.append(name)
     return active
