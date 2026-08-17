@@ -31,7 +31,50 @@ falls back to its configured cloud server by itself — automatic failover.
 - Warnings: decoded QPIWS bit map, `Problem` binary sensor (ignores
   "Line fail" — normal for off-grid sites).
 - Writable: bulk/float/cutoff/recharge/re-discharge voltage (`number.*`),
-  output & charger source priority (`select.*`). Commands ACK/NAK-checked.
+  output & charger source priority, max AC charging current (`select.*`).
+  Commands ACK/NAK-checked.
+- Derived battery state (see **Battery tracking** below): counted SOC,
+  charge stage, absorption-complete flag, voltage-pinned flag.
+
+## Battery tracking
+
+A bank with no BMS gets no trustworthy SOC from the inverter — PI30's
+`battery_capacity` is inferred from terminal voltage, and terminal voltage
+under load is dominated by IR drop. `battery.py` derives better numbers by
+integrating the charge/discharge current the inverter *does* report accurately,
+then re-zeroing that integral once a day at the one moment the true state is
+known for free: the end of absorption, when the bank is full by definition.
+Drift therefore never has to survive longer than one solar cycle.
+
+| Entity | What it means |
+| --- | --- |
+| `sensor.*_battery_soc_counted` | Coulomb-counted SOC. The `calibrated` attribute is `false` until the first absorption re-zero — before that it is an integral started from the inverter's guess. |
+| `sensor.*_battery_charge_stage` | Bulk / Absorption / Float / Discharging / Idle, classified from voltage against the live setpoints plus current direction. |
+| `binary_sensor.*_absorption_complete_today` | The bank reached full today. Latches until local midnight. |
+| `binary_sensor.*_battery_voltage_pinned` | The bank has held a CV plateau long enough to trust it, so it is voltage-limited rather than current-limited — the MPPT is throttling and there is unharvested headroom. |
+| `sensor.*_days_since_absorption` | Whole days that have *ended* without a completed absorption. `0` means it absorbed today or yesterday. |
+| `sensor.*_absorption_minutes_today` | Time spent on the bulk plateau today. |
+
+Absorption is marked complete when charge current falls below the tail
+threshold (default C/50) and holds there at the plateau — or, as a fallback,
+when the inverter drops to float of its own accord after a spell at the bulk
+plateau, since cloud can interrupt the taper before it flattens.
+
+Tunables live in the integration's **Configure** dialog (bank capacity, charge
+efficiency, tail-current fraction, plateau tolerance, hold times) and apply
+live without dropping the collector session. Defaults describe 4S2P OUTDO
+OT200-12(GEL): 48 V, 400 Ah.
+
+State survives restarts via HA's storage helper; the first sample after a
+restart is deliberately not integrated, so downtime can't invent charge.
+
+## Tests
+
+`battery.py` has no Home Assistant imports, so its logic runs standalone:
+
+```
+python3 tests/test_battery.py     # or: pytest tests/
+```
 
 ## Notes
 
@@ -42,5 +85,10 @@ falls back to its configured cloud server by itself — automatic failover.
   firmware `VERFW:00069.02`.
 - Protocol framing was reverse-engineered/validated live; see
   `protocol.py` docstring for the wire format.
+- The max AC charging current select discovers its options from the inverter
+  (`QMUCHGCR` at connect) rather than hard-coding a ladder, and probes both
+  known spellings of the set command (`MUCHGC030` / `MUCHGC30`), keeping
+  whichever ACKs. **Not yet verified on this unit** — check the entity picks
+  up sane options and that a change reads back in `Max AC Charging Current`.
 - Inspired by [ubombi/ha-smartess-local](https://github.com/ubombi/ha-smartess-local)
   (P17 variant of the same transport).

@@ -10,7 +10,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE, UnitOfApparentPower, UnitOfElectricCurrent,
     UnitOfElectricPotential, UnitOfEnergy, UnitOfFrequency, UnitOfPower,
-    UnitOfTemperature,
+    UnitOfTemperature, UnitOfTime,
 )
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
@@ -123,6 +123,17 @@ SENSORS: tuple[InvSensor, ...] = (
               source_key="max_ac_charging_current", native_unit_of_measurement=A,
               device_class=SensorDeviceClass.CURRENT, entity_category=DIAG,
               entity_registry_enabled_default=False),
+    # --- derived battery state (see battery.py) ---
+    InvSensor(key="battery_soc_counted", name="Battery SOC (Counted)", bucket="_battery",
+              source_key="soc_percent", native_unit_of_measurement=PERCENTAGE,
+              device_class=SensorDeviceClass.BATTERY, state_class=MEAS),
+    InvSensor(key="days_since_absorption", name="Days Since Absorption", bucket="_battery",
+              source_key="days_since_absorption", state_class=MEAS,
+              icon="mdi:calendar-alert", entity_category=DIAG),
+    InvSensor(key="absorption_minutes_today", name="Absorption Minutes Today",
+              bucket="_battery", source_key="absorption_minutes_today",
+              native_unit_of_measurement=UnitOfTime.MINUTES, state_class=MEAS,
+              icon="mdi:timer-outline", entity_category=DIAG),
     # --- energy counters (native, no Riemann needed) ---
     InvSensor(key="pv_energy_total", name="PV Energy Total", bucket="_root", source_key="ET_KWH",
               native_unit_of_measurement=KWH, device_class=SensorDeviceClass.ENERGY,
@@ -144,9 +155,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
                             add_entities: AddEntitiesCallback) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
     entities: list[SensorEntity] = [
-        InverterSensor(coordinator, entry.entry_id, d) for d in SENSORS
+        SPECIAL_CLASSES.get(d.key, InverterSensor)(coordinator, entry.entry_id, d)
+        for d in SENSORS
     ]
     entities += [
+        InverterTextSensor(coordinator, entry.entry_id, "battery_charge_stage",
+                           "Battery Charge Stage",
+                           lambda _d: coordinator.battery.stage_label,
+                           icon="mdi:battery-charging-medium"),
         InverterTextSensor(coordinator, entry.entry_id, "operating_mode", "Operating Mode",
                            lambda d: MODE_MAP.get(d.get("MODE", ""), d.get("MODE")),
                            icon="mdi:state-machine"),
@@ -207,11 +223,31 @@ class InverterSensor(InverterEntity, SensorEntity):
     def native_value(self):
         d = self.entity_description
         data = self.coordinator.data
+        if d.bucket == "_battery":
+            return getattr(self.coordinator.battery, d.source_key)
         if d.bucket == "_derived":
             return _derived(data, d.source_key)
         if d.bucket == "_root":
             return data.get(d.source_key)
         return data.get(d.bucket, {}).get(d.source_key)
+
+
+class BatterySocSensor(InverterSensor):
+    """Coulomb-counted SOC, with the counter's own bookkeeping attached.
+
+    `calibrated` matters: until the first absorption completes, this is an
+    integral started from the inverter's guess, so it inherits that error.
+    """
+
+    @property
+    def extra_state_attributes(self):
+        battery = self.coordinator.battery
+        return {
+            "calibrated": battery.calibrated,
+            "amp_hours": battery.amp_hours,
+            "capacity_ah": battery.config.capacity_ah,
+            "charge_efficiency": battery.config.charge_efficiency,
+        }
 
 
 class InverterTextSensor(InverterEntity, SensorEntity):
@@ -228,3 +264,10 @@ class InverterTextSensor(InverterEntity, SensorEntity):
     @property
     def native_value(self):
         return self._value_fn(self.coordinator.data)
+
+
+# Descriptions needing a subclass (extra attributes); the rest use the generic
+# InverterSensor. Keyed by InvSensor.key.
+SPECIAL_CLASSES: dict[str, type[InverterSensor]] = {
+    "battery_soc_counted": BatterySocSensor,
+}

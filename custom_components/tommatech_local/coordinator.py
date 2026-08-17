@@ -12,13 +12,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 
+from .battery import BatteryConfig, BatteryTracker
 from .const import (
+    CONF_ABSORPTION_HOLD_MIN, CONF_BANK_CAPACITY_AH, CONF_CHARGE_EFFICIENCY,
+    CONF_PINNED_HOLD_MIN, CONF_PLATEAU_TOLERANCE_V, CONF_TAIL_CURRENT_FRACTION,
+    DEFAULT_ABSORPTION_HOLD_MIN, DEFAULT_BANK_CAPACITY_AH,
+    DEFAULT_CHARGE_EFFICIENCY, DEFAULT_PINNED_HOLD_MIN,
+    DEFAULT_PLATEAU_TOLERANCE_V, DEFAULT_TAIL_CURRENT_FRACTION,
     DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, DEVICE_STATUS_BITS, DOMAIN,
     POLL_INTERVALS, QPIGS2_FIELDS, QPIGS_FIELDS, QPIRI_FIELDS,
     QPIWS_BITS, QPIWS_INFORMATIONAL, QPIWS_SUPPRESSED, STARTUP_COMMANDS,
@@ -33,10 +42,47 @@ _LOGGER = logging.getLogger(__name__)
 SIGNAL_UPDATE = f"{DOMAIN}_update"
 REQUEST_TIMEOUT = 6.0
 HEARTBEAT_EVERY = 50  # seconds; keeps the dongle owned by us
+BATTERY_STORAGE_VERSION = 1
+# The charge counter is written through a debouncer rather than on every 5 s
+# poll — one flash write a minute, and async_stop() flushes the rest.
+BATTERY_SAVE_DELAY = 60
 # Hold last values through a brief collector drop (WiFi hiccup / re-dial)
 # instead of flipping every entity to unavailable. A genuine outage still
 # surfaces as unavailable once this window passes.
 AVAILABILITY_GRACE = 90  # seconds
+
+
+def battery_config_from_options(options: Mapping[str, Any]) -> BatteryConfig:
+    """Build a BatteryConfig from config-entry options, filling in defaults."""
+    return BatteryConfig(
+        capacity_ah=float(options.get(CONF_BANK_CAPACITY_AH, DEFAULT_BANK_CAPACITY_AH)),
+        charge_efficiency=float(
+            options.get(CONF_CHARGE_EFFICIENCY, DEFAULT_CHARGE_EFFICIENCY)
+        ),
+        tail_current_fraction=float(
+            options.get(CONF_TAIL_CURRENT_FRACTION, DEFAULT_TAIL_CURRENT_FRACTION)
+        ),
+        plateau_tolerance_v=float(
+            options.get(CONF_PLATEAU_TOLERANCE_V, DEFAULT_PLATEAU_TOLERANCE_V)
+        ),
+        absorption_hold_s=float(
+            options.get(CONF_ABSORPTION_HOLD_MIN, DEFAULT_ABSORPTION_HOLD_MIN)
+        ) * 60.0,
+        pinned_hold_s=float(
+            options.get(CONF_PINNED_HOLD_MIN, DEFAULT_PINNED_HOLD_MIN)
+        ) * 60.0,
+    )
+
+
+def _parse_int_list(raw: str) -> list[int]:
+    """Parse a PI30 capability list ('002 010 020 ...') into ints."""
+    out: list[int] = []
+    for token in raw.replace(",", " ").split():
+        try:
+            out.append(int(token))
+        except ValueError:
+            continue
+    return out
 
 
 def _parse_fields(raw: str, field_map: dict[str, int]) -> dict[str, float]:
@@ -54,10 +100,15 @@ def _parse_fields(raw: str, field_map: dict[str, int]) -> dict[str, float]:
 class InverterCoordinator:
     """Owns the socket lifecycle and the current decoded state."""
 
-    def __init__(self, hass: HomeAssistant, host: str, devaddr: int) -> None:
+    def __init__(self, hass: HomeAssistant, host: str, devaddr: int,
+                 entry_id: str, options: Mapping[str, Any] | None = None) -> None:
         self.hass = hass
         self.host = host
         self.devaddr = devaddr
+        self.battery = BatteryTracker(battery_config_from_options(options or {}))
+        self._battery_store: Store = Store(
+            hass, BATTERY_STORAGE_VERSION, f"{DOMAIN}.{entry_id}.battery"
+        )
         self.data: dict[str, Any] = {"connected": False, "pn": None}
         self._server: asyncio.AbstractServer | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -79,6 +130,7 @@ class InverterCoordinator:
 
     # -- lifecycle ----------------------------------------------------
     async def async_start(self) -> None:
+        self.battery.restore(await self._battery_store.async_load())
         self._server = await asyncio.start_server(
             self._handle_conn, "0.0.0.0", DEFAULT_TCP_PORT
         )
@@ -96,6 +148,17 @@ class InverterCoordinator:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        # Flush whatever the debouncer hasn't written yet.
+        await self._battery_store.async_save(self.battery.as_dict())
+
+    def apply_options(self, options: Mapping[str, Any]) -> None:
+        """Re-tune the battery tracker in place when options change.
+
+        Applied live rather than by reloading the entry: a reload would drop
+        the TCP session and the dongle takes an announce round to re-dial.
+        """
+        self.battery.configure(battery_config_from_options(options))
+        async_dispatcher_send(self.hass, SIGNAL_UPDATE)
 
     def _next_tid(self) -> int:
         self._tid = (self._tid + 1) & 0xFFFF
@@ -235,6 +298,7 @@ class InverterCoordinator:
             if len(parts) > 16:
                 parsed["status_bits"] = _parse_status_bits(parts[16])
             self.data["GS"] = parsed
+            self._update_battery(parsed)
         elif cmd == "QPIGS2":
             self.data["GS2"] = _parse_fields(raw, QPIGS2_FIELDS)
         elif cmd == "QPIRI":
@@ -258,6 +322,28 @@ class InverterCoordinator:
             self.data["firmware"] = raw.strip().replace("VERFW:", "")
         elif cmd == "QGMN":
             self.data["model_code"] = raw.strip()
+        elif cmd == "QMUCHGCR":
+            values = _parse_int_list(raw)
+            if values:
+                self.data["AC_CHARGE_CURRENTS"] = values
+
+    def _update_battery(self, gs: dict[str, float]) -> None:
+        """Feed one QPIGS sample to the charge tracker (see battery.py)."""
+        if self.battery.needs_seed and gs.get("battery_capacity") is not None:
+            # Provisional only; the tracker reports calibrated=False until the
+            # first absorption re-zeroes it against reality.
+            self.battery.seed_percent(gs["battery_capacity"])
+        piri = self.data.get("PIRI", {})
+        self.battery.update(
+            voltage=gs.get("battery_voltage"),
+            charge_current=gs.get("battery_charge_current"),
+            discharge_current=gs.get("battery_discharge_current"),
+            bulk_setpoint=piri.get("battery_bulk_voltage"),
+            float_setpoint=piri.get("battery_float_voltage"),
+            now_monotonic=time.monotonic(),
+            now_local_date=dt_util.now().date(),
+        )
+        self._battery_store.async_delay_save(self.battery.as_dict, BATTERY_SAVE_DELAY)
 
     async def _query(self, cmd: str) -> str | None:
         if not self._writer:

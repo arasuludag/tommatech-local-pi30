@@ -16,11 +16,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass,
         host=entry.data[CONF_HOST],
         devaddr=entry.data.get(CONF_DEVADDR, DEFAULT_DEVADDR),
+        entry_id=entry.entry_id,
+        options=entry.options,
     )
     await coordinator.async_start()
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    entry.async_on_unload(entry.add_update_listener(async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
+
+
+async def async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Apply changed options without tearing down the collector session."""
+    coordinator: InverterCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator.apply_options(entry.options)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

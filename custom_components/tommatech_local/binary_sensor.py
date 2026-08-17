@@ -29,6 +29,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         StatusBit(coordinator, eid, "scc_charging", "Solar Charging", icon="mdi:solar-power"),
         StatusBit(coordinator, eid, "ac_charging", "AC Charging", icon="mdi:transmission-tower",
                   enabled_default=False),
+        BatteryFlag(coordinator, eid, "absorption_complete_today",
+                    "Absorption Complete Today", icon="mdi:battery-check"),
+        BatteryFlag(coordinator, eid, "voltage_pinned", "Battery Voltage Pinned",
+                    icon="mdi:arrow-collapse-up"),
     ])
 
 
@@ -96,3 +100,24 @@ class StatusBit(InverterEntity, BinarySensorEntity):
         if not bits:
             return None
         return bits.get(self._bit_key)
+
+
+class BatteryFlag(InverterEntity, BinarySensorEntity):
+    """Boolean read straight off the charge tracker (see battery.py).
+
+    `absorption_complete_today` is the daily health marker — the bank reached
+    full and the SOC counter re-zeroed. `voltage_pinned` is the surplus signal:
+    the bank is sitting on a CV plateau, so it is voltage-limited rather than
+    current-limited and the MPPT is throttling.
+    """
+
+    def __init__(self, coordinator, entry_id, attribute, name, icon=None) -> None:
+        super().__init__(coordinator, entry_id)
+        self._attr_unique_id = f"{entry_id}_{attribute}"
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attribute = attribute
+
+    @property
+    def is_on(self):
+        return getattr(self.coordinator.battery, self._attribute)

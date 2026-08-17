@@ -13,5 +13,29 @@
     "abort": {
       "already_configured": "This inverter is already configured."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Battery tracking",
+        "description": "Tunables for the coulomb-counted SOC and charge-stage detection. Applied immediately; the inverter connection is not interrupted.",
+        "data": {
+          "bank_capacity_ah": "Bank capacity (Ah)",
+          "charge_efficiency": "Charge (coulombic) efficiency",
+          "tail_current_fraction": "Absorption tail current, as a fraction of capacity",
+          "plateau_tolerance_v": "Plateau tolerance (V)",
+          "absorption_hold_min": "Absorption hold before marking complete (minutes)",
+          "pinned_hold_min": "Plateau hold before reporting voltage-pinned (minutes)"
+        },
+        "data_description": {
+          "bank_capacity_ah": "Total amp-hours at the C10 rate. 4S2P of 200 Ah blocks = 400 Ah.",
+          "charge_efficiency": "Fraction of charge current that reaches storage. ~0.90 for lead-acid; the daily re-zero at absorption absorbs any error.",
+          "tail_current_fraction": "0.02 = C/50, i.e. 8 A on a 400 Ah bank. Absorption counts as finished once acceptance falls below this.",
+          "plateau_tolerance_v": "How close to a setpoint counts as sitting on that plateau.",
+          "absorption_hold_min": "How long the tail current must hold before the SOC counter re-zeroes to 100%.",
+          "pinned_hold_min": "How long a plateau must hold before 'Battery Voltage Pinned' turns on."
+        }
+      }
+    }
   }
 }

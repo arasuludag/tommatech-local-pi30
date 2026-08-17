@@ -24,8 +24,14 @@ POLL_INTERVALS = {
     "QLY": 900,     # this-year load energy (year appended at send)
 }
 
-# Commands sent once per connection (static identity).
-STARTUP_COMMANDS = ("QID", "QVFW", "QGMN")
+# Commands sent once per connection (static identity + capability discovery).
+# QMUCHGCR returns the max-utility-charging-current values this unit actually
+# accepts, so the select offers real options instead of a guessed list.
+STARTUP_COMMANDS = ("QID", "QVFW", "QGMN", "QMUCHGCR")
+
+# Used only when QMUCHGCR is unsupported or unparseable — the classic Voltronic
+# ladder. The select falls back to this and logs that it did.
+AC_CHARGE_CURRENT_FALLBACK = (2, 10, 20, 30, 40, 50, 60)
 
 # --- QPIGS field map: key -> index (tokens already carry decimals) ---
 # Verified live against PN W0824353291671 (PI30 / devcode 0x0102).
@@ -136,6 +142,23 @@ QPIWS_INFORMATIONAL = {5}
 # EEPROM fault would break them). The true bit remains visible in the Problem
 # sensor's `raw_qpiws` attribute for diagnostics.
 QPIWS_SUPPRESSED = {17}  # "EEPROM fault" — chronic false positive on this PI30
+
+# --- battery analytics tunables (config entry options) ---------------
+# Defaults describe this site: 4S2P OUTDO OT200-12(GEL) = 48 V, 400 Ah.
+# See battery.py for what each one gates.
+CONF_BANK_CAPACITY_AH = "bank_capacity_ah"
+CONF_CHARGE_EFFICIENCY = "charge_efficiency"
+CONF_TAIL_CURRENT_FRACTION = "tail_current_fraction"
+CONF_PLATEAU_TOLERANCE_V = "plateau_tolerance_v"
+CONF_ABSORPTION_HOLD_MIN = "absorption_hold_min"
+CONF_PINNED_HOLD_MIN = "pinned_hold_min"
+
+DEFAULT_BANK_CAPACITY_AH = 400.0
+DEFAULT_CHARGE_EFFICIENCY = 0.90
+DEFAULT_TAIL_CURRENT_FRACTION = 0.02   # C/50 -> 8 A on a 400 Ah bank
+DEFAULT_PLATEAU_TOLERANCE_V = 0.15
+DEFAULT_ABSORPTION_HOLD_MIN = 15
+DEFAULT_PINNED_HOLD_MIN = 10
 
 MODE_MAP = {
     "P": "Power on", "S": "Standby", "L": "Line", "B": "Battery",
