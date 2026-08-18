@@ -148,6 +148,8 @@ QPIWS_SUPPRESSED = {17}  # "EEPROM fault" — chronic false positive on this PI3
 # See battery.py for what each one gates.
 CONF_BANK_CAPACITY_AH = "bank_capacity_ah"
 CONF_CHARGE_EFFICIENCY = "charge_efficiency"
+CONF_INVERTER_EFFICIENCY = "inverter_efficiency"
+CONF_INVERTER_IDLE_W = "inverter_idle_w"
 CONF_TAIL_CURRENT_FRACTION = "tail_current_fraction"
 CONF_PLATEAU_TOLERANCE_V = "plateau_tolerance_v"
 CONF_ABSORPTION_HOLD_MIN = "absorption_hold_min"
@@ -155,8 +157,10 @@ CONF_PINNED_HOLD_MIN = "pinned_hold_min"
 
 DEFAULT_BANK_CAPACITY_AH = 400.0
 DEFAULT_CHARGE_EFFICIENCY = 0.90
+DEFAULT_INVERTER_EFFICIENCY = 0.92
+DEFAULT_INVERTER_IDLE_W = 30.0
 DEFAULT_TAIL_CURRENT_FRACTION = 0.02   # C/50 -> 8 A on a 400 Ah bank
-DEFAULT_PLATEAU_TOLERANCE_V = 0.15
+DEFAULT_PLATEAU_TOLERANCE_V = 0.35   # unit wanders ~+/-0.3 V off setpoint
 DEFAULT_ABSORPTION_HOLD_MIN = 15
 DEFAULT_PINNED_HOLD_MIN = 10
 

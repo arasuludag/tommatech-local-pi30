@@ -15,11 +15,30 @@ that guess:
 * an honest answer to "did the bank actually finish absorbing today?", which on
   gel is the difference between a healthy bank and a slowly sulfating one.
 
-Both come from integrating the charge/discharge current the inverter *does*
-report accurately, then re-zeroing the integral at the one moment each day when
-the true state is known for free: the end of absorption, when the bank is full
-by definition. Drift accumulated over a day is discarded every afternoon, so
-the counter never has to be right for longer than one solar cycle.
+Which current to believe
+------------------------
+The two ammeters are not equally good, and it matters a great deal.
+
+`battery_charge_current` is sound. Checked against the PV-minus-load energy
+balance across a full day it tracks within ~5% everywhere from 2 A to 42 A, so
+it is used directly, and the absorption tail test can rely on it.
+
+`battery_discharge_current` is not usable. Measured overnight, when PV is zero
+and the bank must therefore supply the entire load plus conversion losses, it
+reported 192 W against a 312 W load, 38 W against 139 W, and 0.6 W against
+105 W — it degrades with load and reads flat zero below roughly 120 W. Across
+one night it accounted for 883 Wh of a ~1950 Wh draw. Integrating that would
+have the counter drifting several points optimistic every single night, which
+is exactly backwards for an evening reserve decision.
+
+So discharge is reconstructed from the energy balance instead — load, adjusted
+for conversion efficiency and the inverter's own idle draw, minus whatever PV
+is contributing. Where the two disagree the larger drain wins, because
+underestimating the drain is the dangerous direction.
+
+Drift is bounded regardless: the integral is re-zeroed to 100% once a day at
+the end of absorption, when the bank is full by definition, so no error has to
+survive longer than one solar cycle.
 """
 from __future__ import annotations
 
@@ -59,6 +78,13 @@ MAX_SAMPLE_GAP_S = 60.0
 # bulk->float transition is accepted as proof that absorption finished.
 FLOAT_CONFIRM_S = 120.0
 
+# A stage change must persist this long before it is committed. This unit does
+# not hold its bulk setpoint tightly — it wanders roughly +/-0.3 V and
+# occasionally overshoots — and without debouncing, each brief excursion off
+# the plateau would reset the absorption and plateau hold timers and they would
+# never mature. Only the committed stage is exposed or acted on.
+STAGE_DEBOUNCE_S = 30.0
+
 
 @dataclass
 class BatteryConfig:
@@ -69,12 +95,21 @@ class BatteryConfig:
     # Lead-acid returns roughly 0.90 of the charge put in; the daily re-zero at
     # absorption absorbs whatever this gets wrong.
     charge_efficiency: float = 0.90
+    # DC->AC conversion efficiency and the inverter's own housekeeping draw,
+    # used to reconstruct discharge from the load. Both are deliberately
+    # adjustable: they are the only fitted parameters in the counter, and the
+    # honest way to trim them is to watch overnight drift against the morning
+    # re-zero.
+    inverter_efficiency: float = 0.92
+    inverter_idle_w: float = 30.0
     # Absorption is finished when acceptance falls to this fraction of C.
     # 0.02 = C/50 = 8 A on a 400 Ah bank, which is where the Aug 16 taper
-    # flattened out on this system.
+    # flattened out on this system, and comfortably inside the range where the
+    # charge ammeter was verified accurate.
     tail_current_fraction: float = 0.02
-    # How close to a setpoint counts as sitting on that plateau.
-    plateau_tolerance_v: float = 0.15
+    # How close to a setpoint counts as sitting on that plateau. Sized for the
+    # observed +/-0.3 V regulation wander, with margin.
+    plateau_tolerance_v: float = 0.35
     absorption_hold_s: float = 900.0   # 15 min at tail current
     pinned_hold_s: float = 600.0       # 10 min on a plateau before trusting it
 
@@ -99,7 +134,10 @@ class BatteryTracker:
         self._last_ts: float | None = None
         self._stage = STAGE_UNKNOWN
         self._stage_since: float | None = None
+        self._pending_stage: str | None = None
+        self._pending_since: float | None = None
         self._tail_since: float | None = None
+        self._net_power_w: float | None = None
         self._today: date | None = None
         self._absorption_done_today = False
         self._saw_absorption_today = False
@@ -174,6 +212,8 @@ class BatteryTracker:
         float_setpoint: float | None,
         now_monotonic: float,
         now_local_date: date,
+        pv_power: float | None = None,
+        ac_output_power: float | None = None,
     ) -> None:
         self._roll_day(now_local_date)
 
@@ -187,26 +227,58 @@ class BatteryTracker:
         if voltage is None or charge_current is None or discharge_current is None:
             return
 
-        stage = self._classify(
-            voltage, charge_current, discharge_current, bulk_setpoint, float_setpoint
+        net_a = self._net_current(
+            voltage, charge_current, discharge_current, pv_power, ac_output_power
         )
-        if stage != self._stage:
-            self._stage = stage
-            self._stage_since = now_monotonic
-            if stage != STAGE_ABSORPTION:
-                self._tail_since = None
-        elif self._stage_since is None:
-            self._stage_since = now_monotonic
+        self._net_power_w = round(net_a * voltage, 1)
+
+        self._commit_stage(
+            self._classify(
+                voltage, charge_current, discharge_current, bulk_setpoint, float_setpoint
+            ),
+            now_monotonic,
+        )
 
         if interval is not None:
-            self._integrate(charge_current, discharge_current, interval)
-            if stage == STAGE_ABSORPTION:
+            self._integrate(net_a, interval)
+            if self._stage == STAGE_ABSORPTION:
                 self._absorption_seconds_today += interval
                 self._saw_absorption_today = True
 
         self._check_absorption_complete(charge_current, now_monotonic)
 
     # -- internals -----------------------------------------------------
+    def _net_current(
+        self,
+        voltage: float,
+        charge_current: float,
+        discharge_current: float,
+        pv_power: float | None,
+        ac_output_power: float | None,
+    ) -> float:
+        """Signed battery current in amps: positive in, negative out.
+
+        See the module docstring for why the two directions come from
+        different sources.
+        """
+        if voltage <= 0:
+            return 0.0
+        if charge_current > IDLE_CURRENT_A:
+            return charge_current * self.config.charge_efficiency
+
+        balance_a = 0.0
+        if pv_power is not None and ac_output_power is not None:
+            deficit_w = (
+                ac_output_power / self.config.inverter_efficiency
+                + self.config.inverter_idle_w
+                - pv_power
+            )
+            balance_a = max(0.0, deficit_w) / voltage
+        # Whichever source claims the larger drain wins. The ammeter is known
+        # to under-read badly; if it ever reads high instead, believing it is
+        # still the conservative direction for a reserve decision.
+        return -max(discharge_current, balance_a)
+
     def _classify(
         self,
         voltage: float,
@@ -226,16 +298,38 @@ class BatteryTracker:
             return STAGE_ABSORPTION
         # Float is a band. A bulk ramp sweeps up through the float voltage on
         # its way to the bulk setpoint, and that must not read as float — it
-        # passes through in seconds, so the pinned_hold_s requirement on
-        # `voltage_pinned` discards the transit anyway.
+        # passes through in seconds, so STAGE_DEBOUNCE_S discards the transit.
         if float_setpoint is not None and abs(voltage - float_setpoint) <= tol:
             return STAGE_FLOAT
         return STAGE_BULK
 
-    def _integrate(self, charge_current: float, discharge_current: float, interval: float) -> None:
+    def _commit_stage(self, stage: str, now_monotonic: float) -> None:
+        """Adopt a new stage only once it has persisted past the debounce."""
+        if stage == self._stage:
+            self._pending_stage = None
+            self._pending_since = None
+            if self._stage_since is None:
+                self._stage_since = now_monotonic
+            return
+        # Explicit None check, not truthiness: a monotonic clock legitimately
+        # reads 0.0, and treating that as "unset" would wedge the timer.
+        if stage != self._pending_stage or self._pending_since is None:
+            self._pending_stage = stage
+            self._pending_since = now_monotonic
+            return
+        if now_monotonic - self._pending_since < STAGE_DEBOUNCE_S:
+            return
+        self._stage = stage
+        # Credit the hold from when the stage actually began, not from now.
+        self._stage_since = self._pending_since
+        self._pending_stage = None
+        self._pending_since = None
+        if stage != STAGE_ABSORPTION:
+            self._tail_since = None
+
+    def _integrate(self, net_a: float, interval: float) -> None:
         if self._ah is None:
             return
-        net_a = charge_current * self.config.charge_efficiency - discharge_current
         self._ah = max(
             0.0, min(self.config.capacity_ah, self._ah + net_a * interval / 3600.0)
         )
@@ -300,6 +394,16 @@ class BatteryTracker:
     @property
     def amp_hours(self) -> float | None:
         return None if self._ah is None else round(self._ah, 1)
+
+    @property
+    def net_power_w(self) -> float | None:
+        """Signed battery power actually being integrated: + in, - out.
+
+        Not the same as the inverter's own charge/discharge power sensors —
+        the discharge side here is reconstructed. Comparing the two is the
+        quickest way to see the ammeter shortfall.
+        """
+        return self._net_power_w
 
     @property
     def calibrated(self) -> bool:

@@ -46,9 +46,39 @@ then re-zeroing that integral once a day at the one moment the true state is
 known for free: the end of absorption, when the bank is full by definition.
 Drift therefore never has to survive longer than one solar cycle.
 
+### Which ammeter is believed
+
+The two current readings on this hardware are not equally trustworthy, which
+changes what the counter integrates.
+
+**Charge current is sound.** Checked against the PV-minus-load energy balance
+over a full day it tracks within ~5% from 2 A to 42 A, so it is used directly
+and the absorption tail test relies on it.
+
+**Discharge current is not usable.** Measured overnight, when PV is zero and
+the bank must supply the entire load plus conversion losses, it reported 192 W
+against a 312 W load, 38 W against 139 W, and 0.6 W against 105 W — it degrades
+with load and reads flat zero below roughly 120 W. Over one night it accounted
+for 883 Wh of an approximately 1950 Wh draw. Integrating that would drift the
+counter several points optimistic every night, which is backwards for a reserve
+decision.
+
+So discharge is reconstructed from the energy balance instead:
+
+    battery_out = ac_output_power / inverter_efficiency + inverter_idle_w - pv_power
+
+Where the reconstruction and the ammeter disagree, the larger drain wins —
+underestimating the drain is the dangerous direction. `inverter_efficiency` and
+`inverter_idle_w` are the only fitted parameters in the counter; trim them by
+watching overnight drift against the morning re-zero.
+
+The stock `battery_discharge_power` sensor is left untouched — it reports what
+the inverter claims. Compare it against `battery_net_power` to see the gap.
+
 | Entity | What it means |
 | --- | --- |
 | `sensor.*_battery_soc_counted` | Coulomb-counted SOC. The `calibrated` attribute is `false` until the first absorption re-zero — before that it is an integral started from the inverter's guess. |
+| `sensor.*_battery_net_power` | Signed battery power actually being integrated (+ in, - out), with discharge reconstructed as above. |
 | `sensor.*_battery_charge_stage` | Bulk / Absorption / Float / Discharging / Idle, classified from voltage against the live setpoints plus current direction. |
 | `binary_sensor.*_absorption_complete_today` | The bank reached full today. Latches until local midnight. |
 | `binary_sensor.*_battery_voltage_pinned` | The bank has held a CV plateau long enough to trust it, so it is voltage-limited rather than current-limited — the MPPT is throttling and there is unharvested headroom. |
@@ -59,6 +89,11 @@ Absorption is marked complete when charge current falls below the tail
 threshold (default C/50) and holds there at the plateau — or, as a fallback,
 when the inverter drops to float of its own accord after a spell at the bulk
 plateau, since cloud can interrupt the taper before it flattens.
+
+This unit does not hold its setpoint tightly; it wanders roughly ±0.3 V and
+occasionally overshoots. Two things absorb that: the plateau tolerance defaults
+to 0.35 V, and stage changes are debounced for 30 s, so a brief excursion off
+the plateau cannot reset the absorption and plateau hold timers.
 
 Tunables live in the integration's **Configure** dialog (bank capacity, charge
 efficiency, tail-current fraction, plateau tolerance, hold times) and apply

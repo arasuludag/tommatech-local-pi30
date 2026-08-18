@@ -10,9 +10,11 @@ from homeassistant.core import callback
 
 from .const import (
     CONF_ABSORPTION_HOLD_MIN, CONF_BANK_CAPACITY_AH, CONF_CHARGE_EFFICIENCY,
-    CONF_DEVADDR, CONF_HOST, CONF_PINNED_HOLD_MIN, CONF_PLATEAU_TOLERANCE_V,
+    CONF_DEVADDR, CONF_HOST, CONF_INVERTER_EFFICIENCY, CONF_INVERTER_IDLE_W,
+    CONF_PINNED_HOLD_MIN, CONF_PLATEAU_TOLERANCE_V,
     CONF_TAIL_CURRENT_FRACTION, DEFAULT_ABSORPTION_HOLD_MIN,
     DEFAULT_BANK_CAPACITY_AH, DEFAULT_CHARGE_EFFICIENCY, DEFAULT_DEVADDR,
+    DEFAULT_INVERTER_EFFICIENCY, DEFAULT_INVERTER_IDLE_W,
     DEFAULT_PINNED_HOLD_MIN, DEFAULT_PLATEAU_TOLERANCE_V,
     DEFAULT_TAIL_CURRENT_FRACTION, DOMAIN,
 )
@@ -66,6 +68,16 @@ class TommatechLocalOptionsFlow(OptionsFlow):
                     CONF_CHARGE_EFFICIENCY,
                     default=options.get(CONF_CHARGE_EFFICIENCY, DEFAULT_CHARGE_EFFICIENCY),
                 ): vol.All(vol.Coerce(float), vol.Range(min=0.5, max=1.0)),
+                vol.Optional(
+                    CONF_INVERTER_EFFICIENCY,
+                    default=options.get(
+                        CONF_INVERTER_EFFICIENCY, DEFAULT_INVERTER_EFFICIENCY
+                    ),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0.5, max=1.0)),
+                vol.Optional(
+                    CONF_INVERTER_IDLE_W,
+                    default=options.get(CONF_INVERTER_IDLE_W, DEFAULT_INVERTER_IDLE_W),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0, max=500)),
                 vol.Optional(
                     CONF_TAIL_CURRENT_FRACTION,
                     default=options.get(

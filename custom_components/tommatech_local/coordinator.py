@@ -24,9 +24,11 @@ from homeassistant.util import dt as dt_util
 from .battery import BatteryConfig, BatteryTracker
 from .const import (
     CONF_ABSORPTION_HOLD_MIN, CONF_BANK_CAPACITY_AH, CONF_CHARGE_EFFICIENCY,
-    CONF_PINNED_HOLD_MIN, CONF_PLATEAU_TOLERANCE_V, CONF_TAIL_CURRENT_FRACTION,
+    CONF_INVERTER_EFFICIENCY, CONF_INVERTER_IDLE_W, CONF_PINNED_HOLD_MIN,
+    CONF_PLATEAU_TOLERANCE_V, CONF_TAIL_CURRENT_FRACTION,
     DEFAULT_ABSORPTION_HOLD_MIN, DEFAULT_BANK_CAPACITY_AH,
-    DEFAULT_CHARGE_EFFICIENCY, DEFAULT_PINNED_HOLD_MIN,
+    DEFAULT_CHARGE_EFFICIENCY, DEFAULT_INVERTER_EFFICIENCY,
+    DEFAULT_INVERTER_IDLE_W, DEFAULT_PINNED_HOLD_MIN,
     DEFAULT_PLATEAU_TOLERANCE_V, DEFAULT_TAIL_CURRENT_FRACTION,
     DEFAULT_TCP_PORT, DEFAULT_UDP_PORT, DEVICE_STATUS_BITS, DOMAIN,
     POLL_INTERVALS, QPIGS2_FIELDS, QPIGS_FIELDS, QPIRI_FIELDS,
@@ -58,6 +60,12 @@ def battery_config_from_options(options: Mapping[str, Any]) -> BatteryConfig:
         capacity_ah=float(options.get(CONF_BANK_CAPACITY_AH, DEFAULT_BANK_CAPACITY_AH)),
         charge_efficiency=float(
             options.get(CONF_CHARGE_EFFICIENCY, DEFAULT_CHARGE_EFFICIENCY)
+        ),
+        inverter_efficiency=float(
+            options.get(CONF_INVERTER_EFFICIENCY, DEFAULT_INVERTER_EFFICIENCY)
+        ),
+        inverter_idle_w=float(
+            options.get(CONF_INVERTER_IDLE_W, DEFAULT_INVERTER_IDLE_W)
         ),
         tail_current_fraction=float(
             options.get(CONF_TAIL_CURRENT_FRACTION, DEFAULT_TAIL_CURRENT_FRACTION)
@@ -334,10 +342,18 @@ class InverterCoordinator:
             # first absorption re-zeroes it against reality.
             self.battery.seed_percent(gs["battery_capacity"])
         piri = self.data.get("PIRI", {})
+        # PV total feeds the discharge reconstruction, so it must include both
+        # strings. GS2 polls at 10 s and may lag GS by one sample; that is well
+        # inside the noise on a 5 s integration step.
+        pv1 = gs.get("pv1_charging_power")
+        pv2 = self.data.get("GS2", {}).get("pv2_charging_power")
+        pv_power = None if pv1 is None else pv1 + (pv2 or 0.0)
         self.battery.update(
             voltage=gs.get("battery_voltage"),
             charge_current=gs.get("battery_charge_current"),
             discharge_current=gs.get("battery_discharge_current"),
+            pv_power=pv_power,
+            ac_output_power=gs.get("ac_output_active_power"),
             bulk_setpoint=piri.get("battery_bulk_voltage"),
             float_setpoint=piri.get("battery_float_voltage"),
             now_monotonic=time.monotonic(),

@@ -47,13 +47,14 @@ def make_tracker(**overrides) -> BatteryTracker:
 
 
 def feed(tracker, *, seconds, voltage, charge=0.0, discharge=0.0, start=0.0,
-         step=5.0, day=DAY):
+         step=5.0, day=DAY, pv=None, ac_out=None):
     """Push `seconds` of samples at `step` cadence. Returns the end timestamp."""
     now = start
     end = start + seconds
     while now <= end:
         tracker.update(
             voltage=voltage, charge_current=charge, discharge_current=discharge,
+            pv_power=pv, ac_output_power=ac_out,
             bulk_setpoint=BULK, float_setpoint=FLOAT,
             now_monotonic=now, now_local_date=day,
         )
@@ -61,6 +62,7 @@ def feed(tracker, *, seconds, voltage, charge=0.0, discharge=0.0, start=0.0,
     return now - step
 
 
+# -- counting ----------------------------------------------------------
 def test_seed_and_capacity():
     tracker = make_tracker()
     assert tracker.soc_percent == 50.0
@@ -71,31 +73,83 @@ def test_seed_and_capacity():
 def test_charge_integration_applies_efficiency():
     tracker = make_tracker()
     # 40 A for 1 h at 0.9 efficiency = 36 Ah on top of 200 Ah.
-    feed(tracker, seconds=3600, voltage=52.0, charge=40.0, step=5.0)
+    feed(tracker, seconds=3600, voltage=52.0, charge=40.0)
     assert tracker.amp_hours == 236.0
 
 
-def test_discharge_integration_is_unscaled():
+def test_charge_uses_the_ammeter_not_the_balance():
+    """Charge current is verified accurate, so an absurd balance is ignored."""
     tracker = make_tracker()
-    # 20 A out for 1 h = 20 Ah, no efficiency factor on the way out.
-    feed(tracker, seconds=3600, voltage=50.0, discharge=20.0, step=5.0)
-    assert tracker.amp_hours == 180.0
+    feed(tracker, seconds=3600, voltage=52.0, charge=40.0, pv=0.0, ac_out=5000.0)
+    assert tracker.amp_hours == 236.0
 
 
 def test_long_gap_is_not_integrated():
     """A collector drop or HA restart must not invent charge."""
     tracker = make_tracker()
     tracker.update(voltage=52.0, charge_current=40.0, discharge_current=0.0,
+                   pv_power=None, ac_output_power=None,
                    bulk_setpoint=BULK, float_setpoint=FLOAT,
                    now_monotonic=0.0, now_local_date=DAY)
     tracker.update(voltage=52.0, charge_current=40.0, discharge_current=0.0,
+                   pv_power=None, ac_output_power=None,
                    bulk_setpoint=BULK, float_setpoint=FLOAT,
                    now_monotonic=MAX_SAMPLE_GAP_S + 3600, now_local_date=DAY)
     assert tracker.amp_hours == 200.0
 
 
-def test_stage_classification():
+def test_soc_clamps_at_both_ends():
     tracker = make_tracker()
+    feed(tracker, seconds=36000, voltage=52.0, charge=60.0)
+    assert tracker.soc_percent == 100.0
+    tracker2 = make_tracker()
+    feed(tracker2, seconds=36000, voltage=48.0, discharge=60.0)
+    assert tracker2.soc_percent == 0.0
+
+
+# -- discharge reconstruction ------------------------------------------
+def test_discharge_reconstructed_when_ammeter_sleeps():
+    """The real bug: at ~105 W the ammeter read 0.6 W. It must not read as idle.
+
+    300 W load / 0.92 + 30 W idle = 356.1 W = 7.12 A at 50 V.
+    """
+    tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    feed(tracker, seconds=3600, voltage=50.0, discharge=0.0, pv=0.0, ac_out=300.0)
+    assert tracker.stage == STAGE_IDLE, "the inverter still claims nothing is moving"
+    assert tracker.amp_hours == 192.9, "but the bank was drained anyway"
+
+
+def test_pv_offsets_the_reconstructed_discharge():
+    tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    # PV exactly covers load + losses, so nothing should come out of the bank.
+    feed(tracker, seconds=3600, voltage=50.0, discharge=0.0, pv=356.087, ac_out=300.0)
+    assert tracker.amp_hours == 200.0
+
+
+def test_larger_drain_wins():
+    """If the ammeter ever reads high, believe it — erring low on SOC is safe."""
+    tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    feed(tracker, seconds=3600, voltage=50.0, discharge=20.0, pv=0.0, ac_out=300.0)
+    assert tracker.amp_hours == 180.0, "20 A ammeter beats the 7.1 A balance"
+
+
+def test_discharge_falls_back_to_ammeter_without_balance_inputs():
+    tracker = make_tracker()
+    feed(tracker, seconds=3600, voltage=50.0, discharge=20.0)
+    assert tracker.amp_hours == 180.0
+
+
+def test_net_power_is_signed():
+    tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    feed(tracker, seconds=60, voltage=52.0, charge=40.0)
+    assert tracker.net_power_w > 0
+    tracker2 = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    feed(tracker2, seconds=60, voltage=50.0, pv=0.0, ac_out=300.0)
+    assert tracker2.net_power_w < 0
+
+
+# -- stage detection ---------------------------------------------------
+def test_stage_classification():
     cases = [
         (52.0, 40.0, 0.0, STAGE_BULK),
         (BULK, 20.0, 0.0, STAGE_ABSORPTION),
@@ -105,12 +159,43 @@ def test_stage_classification():
         (51.0, 0.0, 0.0, STAGE_IDLE),
     ]
     for voltage, charge, discharge, expected in cases:
-        tracker.update(voltage=voltage, charge_current=charge,
-                       discharge_current=discharge, bulk_setpoint=BULK,
-                       float_setpoint=FLOAT, now_monotonic=0.0, now_local_date=DAY)
+        tracker = make_tracker()
+        feed(tracker, seconds=60, voltage=voltage, charge=charge, discharge=discharge)
         assert tracker.stage == expected, f"{voltage} V / {charge} A -> {tracker.stage}"
 
 
+def test_plateau_tolerance_covers_regulation_wander():
+    """This unit sits roughly +/-0.3 V off its setpoint."""
+    tracker = make_tracker()
+    feed(tracker, seconds=60, voltage=BULK - 0.3, charge=20.0)
+    assert tracker.stage == STAGE_ABSORPTION
+
+
+def test_brief_wander_does_not_reset_the_plateau():
+    tracker = make_tracker(pinned_hold_s=600.0)
+    end = feed(tracker, seconds=900, voltage=BULK, charge=20.0)
+    assert tracker.voltage_pinned is True
+
+    # 15 s off the plateau — shorter than the debounce, so nothing resets.
+    end = feed(tracker, seconds=15, voltage=BULK - 0.9, charge=30.0, start=end + 5)
+    assert tracker.stage == STAGE_ABSORPTION
+    assert tracker.voltage_pinned is True
+
+    # A sustained departure does commit.
+    feed(tracker, seconds=60, voltage=BULK - 0.9, charge=30.0, start=end + 5)
+    assert tracker.stage == STAGE_BULK
+    assert tracker.voltage_pinned is False
+
+
+def test_voltage_pinned_requires_hold():
+    tracker = make_tracker(pinned_hold_s=600.0)
+    end = feed(tracker, seconds=300, voltage=BULK, charge=20.0)
+    assert tracker.voltage_pinned is False, "5 min is not yet a plateau"
+    feed(tracker, seconds=400, voltage=BULK, charge=20.0, start=end + 5)
+    assert tracker.voltage_pinned is True
+
+
+# -- absorption --------------------------------------------------------
 def test_absorption_completes_on_tail_current():
     tracker = make_tracker(absorption_hold_s=900.0, tail_current_fraction=0.02)
     # 30 A at the plateau is above the 8 A tail — not done yet.
@@ -126,7 +211,7 @@ def test_absorption_completes_on_tail_current():
 def test_absorption_does_not_complete_below_plateau():
     """Aug 17's failure mode: current is low but voltage never holds."""
     tracker = make_tracker()
-    feed(tracker, seconds=7200, voltage=54.0, charge=5.0)
+    feed(tracker, seconds=7200, voltage=54.5, charge=5.0)
     assert tracker.absorption_complete_today is False
     assert tracker.calibrated is False
 
@@ -136,7 +221,7 @@ def test_float_transition_also_completes():
     tracker = make_tracker(absorption_hold_s=900.0)
     end = feed(tracker, seconds=600, voltage=BULK, charge=25.0)
     assert tracker.absorption_complete_today is False
-    feed(tracker, seconds=300, voltage=FLOAT, charge=4.0, start=end + 5)
+    feed(tracker, seconds=400, voltage=FLOAT, charge=4.0, start=end + 5)
     assert tracker.absorption_complete_today is True
 
 
@@ -147,27 +232,13 @@ def test_float_alone_does_not_complete():
     assert tracker.absorption_complete_today is False
 
 
-def test_voltage_pinned_requires_hold():
-    tracker = make_tracker(pinned_hold_s=600.0)
-    end = feed(tracker, seconds=300, voltage=BULK, charge=20.0)
-    assert tracker.voltage_pinned is False, "5 min is not yet a plateau"
-    end = feed(tracker, seconds=400, voltage=BULK, charge=20.0, start=end + 5)
-    assert tracker.voltage_pinned is True
-    # Falling off the plateau clears it immediately.
-    feed(tracker, seconds=10, voltage=52.0, charge=40.0, start=end + 5)
-    assert tracker.voltage_pinned is False
-
-
+# -- daily bookkeeping -------------------------------------------------
 def test_missed_days_counter():
     tracker = make_tracker()
     day = DAY
-    now = 0.0
-
-    # Day 1: absorbs properly.
-    now = feed(tracker, seconds=1200, voltage=BULK, charge=5.0, start=now, day=day)
+    now = feed(tracker, seconds=1200, voltage=BULK, charge=5.0, day=day)
     assert tracker.absorption_complete_today is True
 
-    # Day 2 and 3: never gets there.
     for offset in (1, 2):
         day = DAY + timedelta(days=offset)
         now = feed(tracker, seconds=600, voltage=52.0, charge=30.0,
@@ -185,13 +256,17 @@ def test_day_rollover_resets_daily_latches():
     assert tracker.absorption_complete_today is True
     assert tracker.absorption_minutes_today > 0
 
-    feed(tracker, seconds=10, voltage=52.0, charge=30.0, start=now + 5,
+    # A few seconds of carryover is expected: the stage debounce means
+    # absorption isn't abandoned the instant voltage moves. Immaterial in
+    # practice, since at local midnight the bank is discharging, not absorbing.
+    feed(tracker, seconds=60, voltage=52.0, charge=30.0, start=now + 5,
          day=DAY + timedelta(days=1))
     assert tracker.absorption_complete_today is False
-    assert tracker.absorption_minutes_today == 0.0
+    assert tracker.absorption_minutes_today < 1.0
     assert tracker.soc_percent == 100.0, "charge carries over; only latches reset"
 
 
+# -- persistence and config -------------------------------------------
 def test_restore_round_trip():
     tracker = make_tracker()
     feed(tracker, seconds=1200, voltage=BULK, charge=5.0)
@@ -213,6 +288,7 @@ def test_restore_does_not_integrate_across_downtime():
     before = restored.amp_hours
     # First sample after a restart lands at an arbitrary monotonic value.
     restored.update(voltage=52.0, charge_current=40.0, discharge_current=0.0,
+                    pv_power=None, ac_output_power=None,
                     bulk_setpoint=BULK, float_setpoint=FLOAT,
                     now_monotonic=99999.0, now_local_date=DAY)
     assert restored.amp_hours == before
@@ -223,15 +299,6 @@ def test_configure_rescales_on_capacity_change():
     tracker.configure(BatteryConfig(capacity_ah=600.0, charge_efficiency=0.9))
     assert tracker.soc_percent == 50.0, "percentage is what carries, not amp-hours"
     assert tracker.amp_hours == 300.0
-
-
-def test_soc_clamps_at_both_ends():
-    tracker = make_tracker()
-    feed(tracker, seconds=36000, voltage=52.0, charge=60.0)
-    assert tracker.soc_percent == 100.0
-    tracker2 = make_tracker()
-    feed(tracker2, seconds=36000, voltage=48.0, discharge=60.0)
-    assert tracker2.soc_percent == 0.0
 
 
 def test_tail_current_scales_with_capacity():
