@@ -86,9 +86,13 @@ the inverter claims. Compare it against `battery_net_power` to see the gap.
 | `sensor.*_absorption_minutes_today` | Time spent on the bulk plateau today. |
 
 Absorption is marked complete when charge current falls below the tail
-threshold (default C/50) and holds there at the plateau — or, as a fallback,
-when the inverter drops to float of its own accord after a spell at the bulk
-plateau, since cloud can interrupt the taper before it flattens.
+threshold (default C/50 = 8 A here) and holds there for 15 minutes while the
+bank sits on a regulation plateau. Either plateau qualifies — the inverter
+sometimes drops to float before the taper at bulk has flattened — but **both
+paths require the tail current**. Voltage alone is not evidence: this unit
+oscillates between its float and bulk setpoints under load, and an earlier
+voltage-only float fallback latched a false completion while the bank was still
+taking 20 A.
 
 This unit does not hold its setpoint tightly; it wanders roughly ±0.3 V and
 occasionally overshoots. Two things absorb that: the plateau tolerance defaults

@@ -217,12 +217,47 @@ def test_absorption_does_not_complete_below_plateau():
 
 
 def test_float_transition_also_completes():
-    """Cloud can interrupt the taper; the inverter's own float call still counts."""
+    """Cloud can interrupt the taper; a genuine float — low current — counts."""
     tracker = make_tracker(absorption_hold_s=900.0)
     end = feed(tracker, seconds=600, voltage=BULK, charge=25.0)
     assert tracker.absorption_complete_today is False
-    feed(tracker, seconds=400, voltage=FLOAT, charge=4.0, start=end + 5)
+    feed(tracker, seconds=1000, voltage=FLOAT, charge=4.0, start=end + 5)
     assert tracker.absorption_complete_today is True
+
+
+def test_float_sag_under_load_does_not_complete():
+    """Regression, 2026-08-18 10:45.
+
+    Voltage sagged through the float band for ~2.5 min during a load-driven
+    oscillation while the bank was still swallowing 20 A, and the old
+    voltage-only fallback latched a false completion.
+    """
+    tracker = make_tracker(absorption_hold_s=900.0)
+    end = feed(tracker, seconds=1200, voltage=BULK, charge=25.0)
+    assert tracker.absorption_complete_today is False
+    feed(tracker, seconds=180, voltage=FLOAT, charge=20.0, start=end + 5)
+    assert tracker.absorption_complete_today is False
+
+
+def test_oscillating_between_plateaus_still_completes():
+    """Absorption <-> float swings at tail current must not reset the hold."""
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=120, voltage=BULK, charge=25.0)
+    now = feed(tracker, seconds=500, voltage=BULK, charge=5.0, start=now + 5)
+    assert tracker.absorption_complete_today is False
+    now = feed(tracker, seconds=200, voltage=FLOAT, charge=5.0, start=now + 5)
+    feed(tracker, seconds=400, voltage=BULK, charge=5.0, start=now + 5)
+    assert tracker.absorption_complete_today is True
+
+
+def test_sag_below_both_plateaus_resets_the_tail_hold():
+    """Dropping off the plateau entirely means the bank was not full."""
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=800, voltage=BULK, charge=5.0)
+    assert tracker.absorption_complete_today is False
+    now = feed(tracker, seconds=120, voltage=52.0, charge=5.0, start=now + 5)
+    feed(tracker, seconds=600, voltage=BULK, charge=5.0, start=now + 5)
+    assert tracker.absorption_complete_today is False, "hold restarts from zero"
 
 
 def test_float_alone_does_not_complete():

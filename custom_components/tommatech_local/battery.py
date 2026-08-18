@@ -39,6 +39,11 @@ underestimating the drain is the dangerous direction.
 Drift is bounded regardless: the integral is re-zeroed to 100% once a day at
 the end of absorption, when the bank is full by definition, so no error has to
 survive longer than one solar cycle.
+
+That re-zero is therefore the one moment that must not be wrong, and it is
+gated on charge current rather than voltage. This inverter swings between its
+float and bulk setpoints under load, so "the voltage is sitting at float" does
+not mean "the charger has finished" — only a sustained tail current does.
 """
 from __future__ import annotations
 
@@ -73,10 +78,6 @@ IDLE_CURRENT_A = 0.5
 # Integrating the last known current across the gap would invent charge that
 # never happened, so the interval is dropped instead of guessed.
 MAX_SAMPLE_GAP_S = 60.0
-
-# How long the bank must sit at the float plateau before the inverter's own
-# bulk->float transition is accepted as proof that absorption finished.
-FLOAT_CONFIRM_S = 120.0
 
 # A stage change must persist this long before it is committed. This unit does
 # not hold its bulk setpoint tightly — it wanders roughly +/-0.3 V and
@@ -324,8 +325,6 @@ class BatteryTracker:
         self._stage_since = self._pending_since
         self._pending_stage = None
         self._pending_since = None
-        if stage != STAGE_ABSORPTION:
-            self._tail_since = None
 
     def _integrate(self, net_a: float, interval: float) -> None:
         if self._ah is None:
@@ -338,26 +337,26 @@ class BatteryTracker:
         if self._absorption_done_today:
             return
         cfg = self.config
-        if self._stage == STAGE_ABSORPTION:
-            if charge_current <= cfg.tail_current_a:
-                if self._tail_since is None:
-                    self._tail_since = now_monotonic
-                elif now_monotonic - self._tail_since >= cfg.absorption_hold_s:
-                    self._mark_absorption_complete("tail current held at plateau")
-            else:
-                self._tail_since = None
-        elif (
-            self._stage == STAGE_FLOAT
-            and self._saw_absorption_today
-            and self._stage_since is not None
-            and now_monotonic - self._stage_since >= FLOAT_CONFIRM_S
-        ):
-            # The inverter dropped to float by itself after a spell at the bulk
-            # plateau. Its stage machine is cruder than the tail-current test,
-            # but a float transition is still the charger declaring the bank
-            # full — and refusing to latch here would strand the counter on
-            # days where cloud interrupts the taper before it flattens.
-            self._mark_absorption_complete("inverter entered float")
+        # Either plateau can end absorption — the inverter sometimes drops to
+        # float before the taper at bulk has flattened — but BOTH paths require
+        # acceptance to have actually fallen to the tail.
+        #
+        # Voltage alone proves nothing here. This unit oscillates between its
+        # float and bulk setpoints under load, and a sag passing through the
+        # float band was enough to latch a false completion at 10:45 on
+        # 2026-08-18 while the bank was still taking 20 A. Current is the only
+        # honest signal that a bank is full; the plateau just says which
+        # regulation point it is sitting on.
+        at_plateau = self._stage == STAGE_ABSORPTION or (
+            self._stage == STAGE_FLOAT and self._saw_absorption_today
+        )
+        if not at_plateau or charge_current > cfg.tail_current_a:
+            self._tail_since = None
+            return
+        if self._tail_since is None:
+            self._tail_since = now_monotonic
+        elif now_monotonic - self._tail_since >= cfg.absorption_hold_s:
+            self._mark_absorption_complete(f"tail current held at {self._stage}")
 
     def _mark_absorption_complete(self, reason: str) -> None:
         self._absorption_done_today = True
