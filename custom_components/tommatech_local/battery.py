@@ -86,6 +86,15 @@ MAX_SAMPLE_GAP_S = 60.0
 # never mature. Only the committed stage is exposed or acted on.
 STAGE_DEBOUNCE_S = 30.0
 
+# How long charge current may exceed the tail threshold without invalidating an
+# absorption hold. Measured 2026-08-19: the bank sat at a 1-5 A mean for over
+# three hours at the plateau, but brief spikes to 9-26 A landed in nearly every
+# five-minute window (EV modulation plus house loads). Requiring an unbroken
+# run reset the timer constantly and absorption never latched despite the bank
+# genuinely being at tail current. Excursions shorter than this are credited
+# back rather than treated as the bank accepting again.
+TAIL_BREAK_TOLERANCE_S = 90.0
+
 
 @dataclass
 class BatteryConfig:
@@ -138,6 +147,7 @@ class BatteryTracker:
         self._pending_stage: str | None = None
         self._pending_since: float | None = None
         self._tail_since: float | None = None
+        self._tail_break_since: float | None = None
         self._net_power_w: float | None = None
         self._today: date | None = None
         self._absorption_done_today = False
@@ -350,9 +360,24 @@ class BatteryTracker:
         at_plateau = self._stage == STAGE_ABSORPTION or (
             self._stage == STAGE_FLOAT and self._saw_absorption_today
         )
-        if not at_plateau or charge_current > cfg.tail_current_a:
+        if not at_plateau:
             self._tail_since = None
+            self._tail_break_since = None
             return
+        if charge_current > cfg.tail_current_a:
+            # Tolerate a brief excursion; only a sustained one means the bank
+            # has genuinely started accepting current again.
+            if self._tail_break_since is None:
+                self._tail_break_since = now_monotonic
+            elif now_monotonic - self._tail_break_since >= TAIL_BREAK_TOLERANCE_S:
+                self._tail_since = None
+                self._tail_break_since = None
+            return
+        if self._tail_break_since is not None:
+            # Credit the excursion back so the hold measures real time at tail.
+            if self._tail_since is not None:
+                self._tail_since += now_monotonic - self._tail_break_since
+            self._tail_break_since = None
         if self._tail_since is None:
             self._tail_since = now_monotonic
         elif now_monotonic - self._tail_since >= cfg.absorption_hold_s:
@@ -364,6 +389,7 @@ class BatteryTracker:
         self._ah = self.config.capacity_ah
         self._calibrated = True
         self._tail_since = None
+        self._tail_break_since = None
         _LOGGER.info("Absorption complete (%s); SOC counter re-zeroed to 100%%", reason)
 
     def _roll_day(self, today: date) -> None:
@@ -382,6 +408,7 @@ class BatteryTracker:
         self._saw_absorption_today = False
         self._absorption_seconds_today = 0.0
         self._tail_since = None
+        self._tail_break_since = None
 
     # -- exposed state -------------------------------------------------
     @property

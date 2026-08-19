@@ -260,6 +260,29 @@ def test_sag_below_both_plateaus_resets_the_tail_hold():
     assert tracker.absorption_complete_today is False, "hold restarts from zero"
 
 
+def test_brief_spike_does_not_break_the_tail_hold():
+    """Regression, 2026-08-19.
+
+    The bank sat at a 1-5 A mean for over three hours at the plateau, but brief
+    spikes to 9-26 A landed in nearly every five-minute window. Requiring an
+    unbroken run reset the timer constantly and absorption never latched.
+    """
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=600, voltage=BULK, charge=5.0)
+    now = feed(tracker, seconds=30, voltage=BULK, charge=20.0, start=now + 5)
+    feed(tracker, seconds=600, voltage=BULK, charge=5.0, start=now + 5)
+    assert tracker.absorption_complete_today is True
+
+
+def test_sustained_rise_does_break_the_tail_hold():
+    """A long excursion means the bank really is accepting current again."""
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=600, voltage=BULK, charge=5.0)
+    now = feed(tracker, seconds=120, voltage=BULK, charge=20.0, start=now + 5)
+    feed(tracker, seconds=600, voltage=BULK, charge=5.0, start=now + 5)
+    assert tracker.absorption_complete_today is False, "hold should restart"
+
+
 def test_float_alone_does_not_complete():
     """Float without having reached the bulk plateau first proves nothing."""
     tracker = make_tracker()
