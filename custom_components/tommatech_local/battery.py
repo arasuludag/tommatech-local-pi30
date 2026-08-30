@@ -44,6 +44,13 @@ That re-zero is therefore the one moment that must not be wrong, and it is
 gated on charge current rather than voltage. This inverter swings between its
 float and bulk setpoints under load, so "the voltage is sitting at float" does
 not mean "the charger has finished" — only a sustained tail current does.
+
+The same caution applies to the stage this module reports, and did not always.
+Float was classified on voltage alone, so the long current-limited crawl up
+through the float band every morning read as Float — and Float is a surplus
+signal that the EV charge controller starts sessions on. Entering float now
+also requires that absorption happened today and that the bank has stopped
+accepting current.
 """
 from __future__ import annotations
 
@@ -307,11 +314,35 @@ class BatteryTracker:
         # load-drop transients (58.1 V seen against a 57.7 V setpoint).
         if bulk_setpoint is not None and voltage >= bulk_setpoint - tol:
             return STAGE_ABSORPTION
-        # Float is a band. A bulk ramp sweeps up through the float voltage on
-        # its way to the bulk setpoint, and that must not read as float — it
-        # passes through in seconds, so STAGE_DEBOUNCE_S discards the transit.
+        # Float is a band, but voltage alone cannot identify it. This code used
+        # to assume a bulk ramp "passes through in seconds, so STAGE_DEBOUNCE_S
+        # discards the transit". It does not. The array is current-limited
+        # during the morning ramp, so the bank CRAWLS through the band:
+        # measured 2026-08-30 it sat inside from 09:18 to 09:31 — thirteen
+        # minutes — while accepting 21-36 A, and reported Float throughout. On
+        # 2026-08-28 the same crawl lasted 22 minutes, and the EV controller,
+        # which starts a session on stage Absorption or Float, opened one at
+        # 09:03 into a bank still swallowing 28 A at 86.6% SOC.
+        #
+        # Entry therefore tests the two things that actually separate a float
+        # from a ramp, neither of which is voltage: absorption must have
+        # happened today, because a charger only ever floats AFTER it has
+        # absorbed, and the bank must not be accepting current, on the same
+        # tail threshold the absorption latch uses.
+        #
+        # Both tests gate ENTRY only — once float is established, staying there
+        # is decided by voltage, as before. That asymmetry is deliberate: it
+        # keeps a load-step current spike from knocking the stage out from
+        # under _check_absorption_complete, whose tail hold has its own and
+        # deliberately longer TAIL_BREAK_TOLERANCE_S for exactly those spikes.
         if float_setpoint is not None and abs(voltage - float_setpoint) <= tol:
-            return STAGE_FLOAT
+            if self._stage == STAGE_FLOAT:
+                return STAGE_FLOAT
+            if (
+                self._saw_absorption_today
+                and charge_current <= self.config.tail_current_a
+            ):
+                return STAGE_FLOAT
         return STAGE_BULK
 
     def _commit_stage(self, stage: str, now_monotonic: float) -> None:

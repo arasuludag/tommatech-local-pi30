@@ -154,7 +154,9 @@ def test_stage_classification():
         (52.0, 40.0, 0.0, STAGE_BULK),
         (BULK, 20.0, 0.0, STAGE_ABSORPTION),
         (BULK + 0.4, 12.0, 0.0, STAGE_ABSORPTION),   # overshoot still counts
-        (FLOAT, 3.0, 0.0, STAGE_FLOAT),
+        # Float voltage on a bank that has not absorbed today is a bulk ramp
+        # crawling through the band, not a float — see the regressions below.
+        (FLOAT, 3.0, 0.0, STAGE_BULK),
         (50.0, 0.0, 15.0, STAGE_DISCHARGING),
         (51.0, 0.0, 0.0, STAGE_IDLE),
     ]
@@ -281,6 +283,56 @@ def test_sustained_rise_does_break_the_tail_hold():
     now = feed(tracker, seconds=120, voltage=BULK, charge=20.0, start=now + 5)
     feed(tracker, seconds=600, voltage=BULK, charge=5.0, start=now + 5)
     assert tracker.absorption_complete_today is False, "hold should restart"
+
+
+def test_bulk_ramp_through_the_float_band_is_not_float():
+    """Regression, 2026-08-30 09:18-09:31.
+
+    The array is current-limited on the morning ramp, so the bank crawls up
+    through the float band instead of crossing it. It sat inside for thirteen
+    minutes while accepting 21-36 A and reported Float the whole time, which is
+    a start gate for the EV charge controller. Two days earlier the same crawl
+    ran 22 minutes and did open a session, at 09:03, into a bank taking 28 A.
+    """
+    tracker = make_tracker()
+    feed(tracker, seconds=780, voltage=FLOAT, charge=30.0)
+    assert tracker.stage == STAGE_BULK
+    assert tracker.voltage_pinned is False, "a ramping bank has no surplus"
+
+
+def test_float_needs_absorption_first():
+    """A charger only ever floats after it has absorbed."""
+    tracker = make_tracker()
+    feed(tracker, seconds=600, voltage=FLOAT, charge=2.0)
+    assert tracker.stage == STAGE_BULK, "tail current alone is not enough"
+
+
+def test_genuine_float_after_absorption_is_reported():
+    tracker = make_tracker()
+    now = feed(tracker, seconds=600, voltage=BULK, charge=25.0)
+    assert tracker.stage == STAGE_ABSORPTION
+    feed(tracker, seconds=120, voltage=FLOAT, charge=4.0, start=now + 5)
+    assert tracker.stage == STAGE_FLOAT
+
+
+def test_established_float_survives_a_current_spike():
+    """The entry tests must not become exit tests.
+
+    Once float is established, leaving it is decided by voltage alone. If a
+    load-step spike could knock the stage out, it would also yank the plateau
+    out from under the absorption tail hold — which has its own, deliberately
+    longer TAIL_BREAK_TOLERANCE_S for exactly these spikes (2026-08-19).
+    """
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=300, voltage=BULK, charge=25.0)
+    now = feed(tracker, seconds=300, voltage=FLOAT, charge=4.0, start=now + 5)
+    assert tracker.stage == STAGE_FLOAT
+
+    now = feed(tracker, seconds=60, voltage=FLOAT, charge=20.0, start=now + 5)
+    assert tracker.stage == STAGE_FLOAT, "a 60 s spike is not the end of float"
+
+    feed(tracker, seconds=700, voltage=FLOAT, charge=4.0, start=now + 5)
+    assert tracker.absorption_complete_today is True, "the tail hold survived"
 
 
 def test_float_alone_does_not_complete():
