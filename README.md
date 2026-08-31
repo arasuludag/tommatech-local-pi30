@@ -80,9 +80,9 @@ the inverter claims. Compare it against `battery_net_power` to see the gap.
 | `sensor.*_battery_soc_counted` | Coulomb-counted SOC. The `calibrated` attribute is `false` until the first absorption re-zero — before that it is an integral started from the inverter's guess. |
 | `sensor.*_battery_net_power` | Signed battery power actually being integrated (+ in, - out), with discharge reconstructed as above. |
 | `sensor.*_battery_charge_stage` | Bulk / Absorption / Float / Discharging / Idle, classified from voltage against the live setpoints plus current direction. |
-| `binary_sensor.*_absorption_complete_today` | The bank reached full today. Latches until local midnight. |
+| `binary_sensor.*_absorption_complete_today` | The bank has had its absorption today, by either path below. Latches until local midnight. |
 | `binary_sensor.*_battery_voltage_pinned` | The bank has held a CV plateau long enough to trust it, so it is voltage-limited rather than current-limited — the MPPT is throttling and there is unharvested headroom. |
-| `sensor.*_days_since_absorption` | Whole days that have *ended* without a completed absorption. `0` means it absorbed today or yesterday. |
+| `sensor.*_days_since_absorption` | Whole days that have *ended* without an absorption. `0` means it absorbed today or yesterday. Read by the EV charge controller, which restricts charging at `2` and blocks it above that. |
 | `sensor.*_absorption_minutes_today` | Time spent on the bulk plateau today. |
 
 Absorption is marked complete when charge current falls below the tail
@@ -92,12 +92,24 @@ sometimes drops to float before the taper at bulk has flattened — but **both
 paths require the tail current**. Voltage alone is not evidence: this unit
 oscillates between its float and bulk setpoints under load, and an earlier
 voltage-only float fallback latched a false completion while the bank was still
-taking 20 A.
+taking 20 A. This is the path that also **re-zeroes the SOC counter to 100 %**,
+because only tail current proves the bank is actually full.
+
+A second path marks the *day* satisfied without touching the counter:
+**2 hours cumulative at the absorption setpoint** (`absorption_satisfied_s`).
+The two claims are different — "this bank has been properly recharged recently"
+is much weaker than "the counter reads 100 % right now" — and latching them
+together cost the weaker one. The tail hold can be denied all day by a choppy
+sky or an EV session stealing the taper, and on 2026-08-30 it was: 67 minutes at
+the setpoint, no tail hold, day counted as missed. Two of those in a row and
+`days_since_absorption` blocked EV charging on a bank sitting at 96.5 %.
 
 This unit does not hold its setpoint tightly; it wanders roughly ±0.3 V and
-occasionally overshoots. Two things absorb that: the plateau tolerance defaults
-to 0.35 V, and stage changes are debounced for 30 s, so a brief excursion off
-the plateau cannot reset the absorption and plateau hold timers.
+occasionally overshoots. Three things absorb that: the plateau tolerance
+defaults to 0.35 V, stage changes are debounced for 30 s, and an excursion —
+either off the plateau (180 s) or above the tail current (90 s) — is credited
+back to the hold rather than resetting it, so the hold measures real
+at-plateau-at-tail seconds.
 
 Tunables live in the integration's **Configure** dialog (bank capacity, charge
 efficiency, tail-current fraction, plateau tolerance, hold times) and apply

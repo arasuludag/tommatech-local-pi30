@@ -252,14 +252,25 @@ def test_oscillating_between_plateaus_still_completes():
     assert tracker.absorption_complete_today is True
 
 
-def test_sag_below_both_plateaus_resets_the_tail_hold():
-    """Dropping off the plateau entirely means the bank was not full."""
+def test_brief_sag_below_both_plateaus_is_credited_back():
+    """Contract reversed 2026-08-31, and the old premise was wrong.
+
+    This used to assert that any drop off the plateau restarts the hold, on the
+    reasoning that "dropping off the plateau entirely means the bank was not
+    full". The 2026-08-30 traces say otherwise: with an EV session running, the
+    bus leaves the setpoint for one to five minutes at a time all day, because
+    the car is taking what the array makes. That is a statement about the load,
+    not about the bank — and treating it as a reset is what starved
+    days_since_absorption into locking the car out. A sag shorter than
+    PLATEAU_BREAK_TOLERANCE_S is now credited back; a sustained one still
+    resets, which test_sustained_off_plateau_still_resets_the_tail_hold covers.
+    """
     tracker = make_tracker(absorption_hold_s=900.0)
     now = feed(tracker, seconds=800, voltage=BULK, charge=5.0)
     assert tracker.absorption_complete_today is False
     now = feed(tracker, seconds=120, voltage=52.0, charge=5.0, start=now + 5)
     feed(tracker, seconds=600, voltage=BULK, charge=5.0, start=now + 5)
-    assert tracker.absorption_complete_today is False, "hold restarts from zero"
+    assert tracker.absorption_complete_today is True, "120 s sag is not a reset"
 
 
 def test_brief_spike_does_not_break_the_tail_hold():
@@ -340,6 +351,94 @@ def test_float_alone_does_not_complete():
     tracker = make_tracker()
     feed(tracker, seconds=3600, voltage=FLOAT, charge=4.0)
     assert tracker.absorption_complete_today is False
+
+
+# -- the EV lockout: absorption must survive a choppy plateau ----------
+def test_brief_off_plateau_excursions_do_not_reset_the_tail_hold():
+    """Reproduces 2026-08-30 and the lockout it caused on 2026-08-31.
+
+    With an EV session running, the committed stage bounced off the plateau
+    every one to five minutes for six hours. Each excursion used to wipe the
+    tail hold outright, so the 15-minute latch never matured, the day ended
+    "unabsorbed" with 67 minutes at the setpoint on the clock, and two such
+    days in a row blocked EV charging on a bank at 96.5%.
+    """
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=300, voltage=BULK, charge=25.0)
+    assert tracker.stage == STAGE_ABSORPTION
+
+    # Six cycles of 150 s at tail then 60 s knocked off the plateau by the car
+    # (plus 30 s of debounce coming back) — every excursion inside
+    # PLATEAU_BREAK_TOLERANCE_S. Total real plateau-at-tail time > 15 min.
+    for _ in range(6):
+        now = feed(tracker, seconds=150, voltage=BULK, charge=4.0, start=now + 5)
+        now = feed(tracker, seconds=60, voltage=52.0, charge=30.0, start=now + 5)
+    now = feed(tracker, seconds=150, voltage=BULK, charge=4.0, start=now + 5)
+
+    assert tracker.absorption_complete_today is True, "the hold survived the chop"
+    assert tracker.days_since_absorption == 0
+
+
+def test_sustained_off_plateau_still_resets_the_tail_hold():
+    """The tolerance is for chop, not for a bank that genuinely came off."""
+    tracker = make_tracker(absorption_hold_s=900.0)
+    now = feed(tracker, seconds=800, voltage=BULK, charge=4.0)
+    assert tracker.absorption_complete_today is False, "not yet 15 min"
+
+    # Longer than PLATEAU_BREAK_TOLERANCE_S: the accumulated hold is discarded.
+    now = feed(tracker, seconds=300, voltage=52.0, charge=30.0, start=now + 5)
+    now = feed(tracker, seconds=300, voltage=BULK, charge=4.0, start=now + 5)
+    assert tracker.absorption_complete_today is False, "hold restarted from zero"
+
+    feed(tracker, seconds=700, voltage=BULK, charge=4.0, start=now + 5)
+    assert tracker.absorption_complete_today is True
+
+
+def test_time_at_setpoint_satisfies_the_day_without_recalibrating():
+    """Path two: 2 h voltage-limited is an absorption even with no tail hold.
+
+    The bank never gets near tail current here — the car is taking everything
+    the array makes — but it spent two hours pinned at the setpoint, which is
+    what the day counter is actually asking about.
+    """
+    tracker = make_tracker(absorption_satisfied_s=7200.0)
+    feed(tracker, seconds=7300, voltage=BULK, charge=25.0)
+
+    assert tracker.absorption_complete_today is True, "the day is satisfied"
+    assert tracker.days_since_absorption == 0, "no EV lockout tomorrow"
+    assert tracker.calibrated is False, "time at the setpoint is not proof of full"
+    assert tracker.soc_percent is not None and tracker.soc_percent < 100.0
+
+
+def test_tail_hold_still_recalibrates_after_the_day_is_satisfied():
+    """The satisfied latch must not swallow the counter re-zero.
+
+    Both facts used to share one flag, so whichever fired first ended the
+    check for the day — and the weaker one firing first would have cost the
+    daily SOC calibration, which is the more valuable of the two.
+    """
+    tracker = make_tracker(absorption_hold_s=900.0, absorption_satisfied_s=7200.0)
+    now = feed(tracker, seconds=7300, voltage=BULK, charge=25.0)
+    assert tracker.absorption_complete_today is True
+    assert tracker.calibrated is False
+
+    feed(tracker, seconds=1000, voltage=BULK, charge=4.0, start=now + 5)
+    assert tracker.calibrated is True, "the tail hold still earns the re-zero"
+    assert tracker.soc_percent == 100.0
+
+
+def test_satisfied_day_survives_a_restart():
+    """Old stored state has no recalibrated_today: fall back to the old flag."""
+    tracker = make_tracker()
+    feed(tracker, seconds=1200, voltage=BULK, charge=5.0)
+    stored = tracker.as_dict()
+    assert stored["absorption_done_today"] is True
+    assert stored["recalibrated_today"] is True
+
+    revived = make_tracker()
+    revived.restore({k: v for k, v in stored.items() if k != "recalibrated_today"})
+    assert revived.absorption_complete_today is True
+    assert revived.days_since_absorption == 0
 
 
 # -- daily bookkeeping -------------------------------------------------

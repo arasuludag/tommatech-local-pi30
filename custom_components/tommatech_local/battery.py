@@ -102,6 +102,22 @@ STAGE_DEBOUNCE_S = 30.0
 # back rather than treated as the bank accepting again.
 TAIL_BREAK_TOLERANCE_S = 90.0
 
+# The same idea applied to the PLATEAU test, and for the same reason one step
+# further out. Measured 2026-08-30: from the moment the EV session opened at
+# 10:23 the committed stage bounced Absorption -> Bulk -> Discharging every one
+# to five minutes for six hours, because the car takes the array's output and
+# the bus falls off the setpoint. Every one of those excursions used to wipe
+# _tail_since outright, so the 15-minute hold could never assemble and the day
+# ended "unabsorbed" with 67 minutes at the setpoint on the clock. Two such
+# days in a row block EV charging (days_since_absorption > 1), which is how the
+# car locked itself out of a bank sitting at 96.5% on 2026-08-31.
+#
+# Deliberately longer than TAIL_BREAK_TOLERANCE_S: a current spike is one load
+# step, an off-plateau excursion is the array losing the setpoint, which on a
+# cloudy day takes minutes to recover. Time inside an excursion is credited
+# back, never counted, so the hold still measures real at-plateau seconds.
+PLATEAU_BREAK_TOLERANCE_S = 180.0
+
 
 @dataclass
 class BatteryConfig:
@@ -129,6 +145,17 @@ class BatteryConfig:
     plateau_tolerance_v: float = 0.35
     absorption_hold_s: float = 900.0   # 15 min at tail current
     pinned_hold_s: float = 600.0       # 10 min on a plateau before trusting it
+    # Second, time-based completion path, independent of the tail evidence.
+    # Cumulative seconds at the absorption setpoint that count as the bank
+    # having had its absorption for the day. 2 h is the textbook gel absorption
+    # period from the ~80% where this bank reaches 57.5 V, and these seconds are
+    # only accrued while the bus is genuinely voltage-limited at the setpoint —
+    # a bank being robbed by the EV drops off the plateau and stops accruing.
+    # This exists because the tail hold is evidence of a FULL bank and can be
+    # denied all day by a choppy sky or an EV session, while the day counter it
+    # feeds is supposed to answer a much weaker question: has this bank had a
+    # proper absorption recently. Two hours at the setpoint answers that yes.
+    absorption_satisfied_s: float = 7200.0
 
     @property
     def tail_current_a(self) -> float:
@@ -154,10 +181,11 @@ class BatteryTracker:
         self._pending_stage: str | None = None
         self._pending_since: float | None = None
         self._tail_since: float | None = None
-        self._tail_break_since: float | None = None
+        self._break_since: float | None = None
         self._net_power_w: float | None = None
         self._today: date | None = None
         self._absorption_done_today = False
+        self._recalibrated_today = False
         self._saw_absorption_today = False
         self._absorption_seconds_today = 0.0
         self._days_since_absorption: int | None = None
@@ -178,6 +206,7 @@ class BatteryTracker:
             "calibrated": self._calibrated,
             "date": self._today.isoformat() if self._today else None,
             "absorption_done_today": self._absorption_done_today,
+            "recalibrated_today": self._recalibrated_today,
             "saw_absorption_today": self._saw_absorption_today,
             "absorption_seconds_today": round(self._absorption_seconds_today),
             "days_since_absorption": self._days_since_absorption,
@@ -200,6 +229,11 @@ class BatteryTracker:
             except ValueError:
                 self._today = None
         self._absorption_done_today = bool(stored.get("absorption_done_today", False))
+        # Absent in state written before the satisfied/recalibrated split: fall
+        # back to the old flag, which used to mean both things at once.
+        self._recalibrated_today = bool(
+            stored.get("recalibrated_today", self._absorption_done_today)
+        )
         self._saw_absorption_today = bool(stored.get("saw_absorption_today", False))
         self._absorption_seconds_today = float(stored.get("absorption_seconds_today", 0) or 0)
         self._days_since_absorption = stored.get("days_since_absorption")
@@ -375,9 +409,26 @@ class BatteryTracker:
         )
 
     def _check_absorption_complete(self, charge_current: float, now_monotonic: float) -> None:
-        if self._absorption_done_today:
-            return
         cfg = self.config
+        # Path two, and it is checked first because it needs nothing from the
+        # tail logic below: enough cumulative time at the setpoint IS an
+        # absorption, whether or not acceptance was ever observed to fall to
+        # the tail. This is the path that keeps days_since_absorption honest on
+        # days when the EV or the sky denies the tail hold. It deliberately
+        # does NOT re-zero the SOC counter — 2 h of voltage-limited charging
+        # says the bank had its absorption, not that it reached 100%.
+        if (
+            not self._absorption_done_today
+            and self._absorption_seconds_today >= cfg.absorption_satisfied_s
+        ):
+            self._mark_absorption_satisfied(
+                f"{self._absorption_seconds_today / 60:.0f} min cumulative at the setpoint"
+            )
+        # The tail path keeps running even once the day is satisfied, because
+        # only it earns the counter re-zero, and that calibration is worth more
+        # than the day counter it shares a latch with.
+        if self._recalibrated_today:
+            return
         # Either plateau can end absorption — the inverter sometimes drops to
         # float before the taper at bulk has flattened — but BOTH paths require
         # acceptance to have actually fallen to the tail.
@@ -392,35 +443,67 @@ class BatteryTracker:
             self._stage == STAGE_FLOAT and self._saw_absorption_today
         )
         if not at_plateau:
-            self._tail_since = None
-            self._tail_break_since = None
+            # Tolerated and credited back exactly like a current excursion,
+            # on the longer PLATEAU_BREAK_TOLERANCE_S. The old code reset here
+            # unconditionally, so one Bulk or Discharging sample threw away
+            # however many minutes of hold had accumulated — and under an EV
+            # session that sample arrives every one to five minutes, so the
+            # hold never matured. See the constant.
+            self._note_hold_break(now_monotonic, PLATEAU_BREAK_TOLERANCE_S)
             return
         if charge_current > cfg.tail_current_a:
             # Tolerate a brief excursion; only a sustained one means the bank
             # has genuinely started accepting current again.
-            if self._tail_break_since is None:
-                self._tail_break_since = now_monotonic
-            elif now_monotonic - self._tail_break_since >= TAIL_BREAK_TOLERANCE_S:
-                self._tail_since = None
-                self._tail_break_since = None
+            self._note_hold_break(now_monotonic, TAIL_BREAK_TOLERANCE_S)
             return
-        if self._tail_break_since is not None:
+        if self._break_since is not None:
             # Credit the excursion back so the hold measures real time at tail.
             if self._tail_since is not None:
-                self._tail_since += now_monotonic - self._tail_break_since
-            self._tail_break_since = None
+                self._tail_since += now_monotonic - self._break_since
+            self._break_since = None
         if self._tail_since is None:
             self._tail_since = now_monotonic
         elif now_monotonic - self._tail_since >= cfg.absorption_hold_s:
             self._mark_absorption_complete(f"tail current held at {self._stage}")
 
-    def _mark_absorption_complete(self, reason: str) -> None:
+    def _note_hold_break(self, now_monotonic: float, tolerance: float) -> None:
+        """One excursion tracker, two tolerances.
+
+        Deliberately a single field rather than one per break kind. An EV
+        session produces excursions that begin as a current rise and continue
+        as an off-plateau drop, and with a tracker per kind both credited the
+        same wall-clock seconds back to the hold — pushing _tail_since forward
+        faster than time passed, so the latch could never mature. The tolerance
+        applied is whatever the current sample calls for; the elapsed time is
+        measured from when the excursion began, whichever kind started it.
+        """
+        if self._break_since is None:
+            self._break_since = now_monotonic
+        elif now_monotonic - self._break_since >= tolerance:
+            self._tail_since = None
+            self._break_since = None
+
+    def _mark_absorption_satisfied(self, reason: str) -> None:
+        """The bank has had its absorption today — day counter only.
+
+        Split out from _mark_absorption_complete on 2026-08-31. The two facts
+        were latched together and they are not the same claim: "this bank has
+        been properly recharged recently" (what days_since_absorption reports,
+        and what gates EV charging) is much weaker than "the counter can be
+        trusted to read 100% right now".
+        """
         self._absorption_done_today = True
         self._days_since_absorption = 0
+        self._tail_since = None
+        self._break_since = None
+        _LOGGER.info("Absorption satisfied for today (%s)", reason)
+
+    def _mark_absorption_complete(self, reason: str) -> None:
+        """Tail-current evidence: the bank is full, so also re-zero the counter."""
+        self._mark_absorption_satisfied(reason)
+        self._recalibrated_today = True
         self._ah = self.config.capacity_ah
         self._calibrated = True
-        self._tail_since = None
-        self._tail_break_since = None
         _LOGGER.info("Absorption complete (%s); SOC counter re-zeroed to 100%%", reason)
 
     def _roll_day(self, today: date) -> None:
@@ -436,10 +519,11 @@ class BatteryTracker:
                 self._days_since_absorption += 1
         self._today = today
         self._absorption_done_today = False
+        self._recalibrated_today = False
         self._saw_absorption_today = False
         self._absorption_seconds_today = 0.0
         self._tail_since = None
-        self._tail_break_since = None
+        self._break_since = None
 
     # -- exposed state -------------------------------------------------
     @property

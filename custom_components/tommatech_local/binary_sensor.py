@@ -105,8 +105,10 @@ class StatusBit(InverterEntity, BinarySensorEntity):
 class BatteryFlag(InverterEntity, BinarySensorEntity):
     """Boolean read straight off the charge tracker (see battery.py).
 
-    `absorption_complete_today` is the daily health marker — the bank reached
-    full and the SOC counter re-zeroed. `voltage_pinned` is the surplus signal:
+    `absorption_complete_today` is the daily health marker — the bank has had
+    its absorption today, either by holding tail current (which also re-zeroes
+    the SOC counter) or by accumulating `absorption_satisfied_s` at the
+    setpoint (which does not). `voltage_pinned` is the surplus signal:
     the bank is sitting on a CV plateau, so it is voltage-limited rather than
     current-limited and the MPPT is throttling.
     """
