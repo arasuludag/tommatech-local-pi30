@@ -48,8 +48,9 @@ Drift therefore never has to survive longer than one solar cycle.
 
 ### Which ammeter is believed
 
-The two current readings on this hardware are not equally trustworthy, which
-changes what the counter integrates.
+On the reference unit (see **Notes**) the two current readings are not equally
+trustworthy, which changes what the counter integrates. Other PI30 units may
+behave differently; check yours the same way before trusting either.
 
 **Charge current is sound.** Checked against the PV-minus-load energy balance
 over a full day it tracks within ~5% from 2 A to 42 A, so it is used directly
@@ -72,6 +73,12 @@ underestimating the drain is the dangerous direction. `inverter_efficiency` and
 `inverter_idle_w` are the only fitted parameters in the counter; trim them by
 watching overnight drift against the morning re-zero.
 
+The one exception is **Line mode** (QMOD `L`): with the grid, a generator or a
+vehicle's V2L outlet on the AC input, the inverter passes that input straight
+through to the load, so the balance describes the AC source rather than the
+bank. There the reconstruction is skipped and only the ammeters count; AC
+charging still shows up on the charge ammeter like PV charging does.
+
 The stock `battery_discharge_power` sensor is left untouched — it reports what
 the inverter claims. Compare it against `battery_net_power` to see the gap.
 
@@ -82,15 +89,15 @@ the inverter claims. Compare it against `battery_net_power` to see the gap.
 | `sensor.*_battery_charge_stage` | Bulk / Absorption / Float / Discharging / Idle, classified from voltage against the live setpoints plus current direction. |
 | `binary_sensor.*_absorption_complete_today` | The bank has had its absorption today, by either path below. Latches until local midnight. |
 | `binary_sensor.*_battery_voltage_pinned` | The bank has held a CV plateau long enough to trust it, so it is voltage-limited rather than current-limited — the MPPT is throttling and there is unharvested headroom. |
-| `sensor.*_days_since_absorption` | Whole days that have *ended* without an absorption. `0` means it absorbed today or yesterday. Read by the EV charge controller, which restricts charging at `2` and blocks it above that. |
+| `sensor.*_days_since_absorption` | Whole days that have *ended* without an absorption. `0` means it absorbed today or yesterday. Meant for gating opportunistic loads, e.g. holding off EV charging once it reaches `2`. |
 | `sensor.*_absorption_minutes_today` | Time spent on the bulk plateau today. |
 
 Absorption is marked complete when charge current falls below the tail
-threshold (default C/50 = 8 A here) and holds there for 15 minutes while the
-bank sits on a regulation plateau. Either plateau qualifies — the inverter
-sometimes drops to float before the taper at bulk has flattened — but **both
-paths require the tail current**. Voltage alone is not evidence: this unit
-oscillates between its float and bulk setpoints under load, and an earlier
+threshold (default C/50, i.e. 8 A on a 400 Ah bank) and holds there for 15
+minutes while the bank sits on a regulation plateau. Either plateau qualifies —
+the inverter sometimes drops to float before the taper at bulk has flattened —
+but **both paths require the tail current**. Voltage alone is not evidence: the
+reference unit oscillates between its float and bulk setpoints under load, and an earlier
 voltage-only float fallback latched a false completion while the bank was still
 taking 20 A. This is the path that also **re-zeroes the SOC counter to 100 %**,
 because only tail current proves the bank is actually full.
@@ -100,11 +107,10 @@ A second path marks the *day* satisfied without touching the counter:
 The two claims are different — "this bank has been properly recharged recently"
 is much weaker than "the counter reads 100 % right now" — and latching them
 together cost the weaker one. The tail hold can be denied all day by a choppy
-sky or an EV session stealing the taper, and on 2026-08-30 it was: 67 minutes at
-the setpoint, no tail hold, day counted as missed. Two of those in a row and
-`days_since_absorption` blocked EV charging on a bank sitting at 96.5 %.
+sky or a large load stealing the taper: an hour or more at the setpoint, no
+tail hold, and the day counted as missed on a bank that was nearly full.
 
-This unit does not hold its setpoint tightly; it wanders roughly ±0.3 V and
+The reference unit does not hold its setpoint tightly; it wanders roughly ±0.3 V and
 occasionally overshoots. Three things absorb that: the plateau tolerance
 defaults to 0.35 V, stage changes are debounced for 30 s, and an excursion —
 either off the plateau (180 s) or above the tail current (90 s) — is credited
@@ -113,11 +119,29 @@ at-plateau-at-tail seconds.
 
 Tunables live in the integration's **Configure** dialog (bank capacity, charge
 efficiency, tail-current fraction, plateau tolerance, hold times) and apply
-live without dropping the collector session. Defaults describe 4S2P OUTDO
-OT200-12(GEL): 48 V, 400 Ah.
+live without dropping the collector session. Defaults describe the reference
+bank (48 V, 400 Ah lead-acid gel), so set at least the capacity to match yours.
 
 State survives restarts via HA's storage helper; the first sample after a
 restart is deliberately not integrated, so downtime can't invent charge.
+
+## Adapting to your system
+
+Nothing about a particular site is hard-coded beyond the defaults above. On a
+different PI30 unit:
+
+- Enter your collector dongle's IP when adding the integration (your router's
+  DHCP list will have it). The dongle must be able to reach Home Assistant on
+  TCP 8899, and Home Assistant must reach the dongle on UDP 58899.
+- Set the bank capacity under **Configure** and review the other tunables.
+  Trim `inverter_efficiency` and `inverter_idle_w` by watching overnight drift
+  against the morning re-zero.
+- `QPIWS_SUPPRESSED` in `const.py` drops one warning bit (EEPROM fault) that
+  the reference unit asserts permanently. If yours doesn't, remove it so a real
+  fault is not hidden.
+- The `Problem` sensor treats "Line fail" as informational, which suits an
+  off-grid site. On a grid-tied site, watch `Operating Mode` or `Grid Voltage`
+  for outages instead.
 
 ## Tests
 
@@ -131,15 +155,16 @@ python3 tests/test_battery.py     # or: pytest tests/
 
 - Poll cadence is defined in `const.py` (`POLL_INTERVALS`). The PI30 serial
   bus comfortably handles ~1 cmd/s; defaults stay well under that.
-- Verified against: Tommatech 7.2 kW 48 V (devcode 0x0102 heartbeat,
-  dess devcode 2449), collector PN `W08243532916xx`, protocol `PI30`,
-  firmware `VERFW:00069.02`.
+- Reference unit: Tommatech 7.2 kW 48 V (devcode 0x0102 heartbeat,
+  dess devcode 2449) on an EyBond collector, protocol `PI30`, firmware
+  `VERFW:00069.02`. Measurements quoted in this README and the code comments
+  come from it.
 - Protocol framing was reverse-engineered/validated live; see
   `protocol.py` docstring for the wire format.
 - The max AC charging current select discovers its options from the inverter
   (`QMUCHGCR` at connect) rather than hard-coding a ladder, and probes both
   known spellings of the set command (`MUCHGC030` / `MUCHGC30`), keeping
-  whichever ACKs. **Not yet verified on this unit** — check the entity picks
-  up sane options and that a change reads back in `Max AC Charging Current`.
+  whichever ACKs. Verified on the reference unit: a change reads back via
+  QPIRI and the AC charge current follows it.
 - Inspired by [ubombi/ha-smartess-local](https://github.com/ubombi/ha-smartess-local)
   (P17 variant of the same transport).

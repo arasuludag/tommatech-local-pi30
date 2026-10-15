@@ -75,7 +75,7 @@ SENSORS: tuple[InvSensor, ...] = (
     InvSensor(key="output_load_percent", name="Output Load", bucket="GS",
               source_key="output_load_percent", native_unit_of_measurement=PERCENTAGE,
               state_class=MEAS, icon="mdi:percent"),
-    # --- grid (permanently 0 off-grid, still mapped) ---
+    # --- AC input (grid / generator / V2L; reads 0 while absent) ---
     _v("grid_voltage", "Grid Voltage", "GS", "grid_voltage"),
     InvSensor(key="grid_frequency", name="Grid Frequency", bucket="GS",
               source_key="grid_frequency", native_unit_of_measurement=UnitOfFrequency.HERTZ,

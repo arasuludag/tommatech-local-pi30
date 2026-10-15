@@ -1,4 +1,4 @@
-"""Source-priority selects and the max AC (generator) charging current."""
+"""Source-priority selects and the max AC-input charging current."""
 from __future__ import annotations
 
 import logging
@@ -60,11 +60,11 @@ class PrioritySelect(InverterEntity, SelectEntity):
 
 
 class MaxACChargeCurrentSelect(InverterEntity, SelectEntity):
-    """Cap on charge current drawn from the AC input — i.e. the generator.
+    """Cap on charge current drawn from the AC input (grid, generator, V2L).
 
-    Off-grid this only bites while a genset is running, and the right value
-    depends on which set is connected: too high stalls or overloads a small
-    one, too low wastes runtime. Hence a control rather than a fixed setting.
+    The right value depends on what is connected: too high stalls or
+    overloads a small generator or a vehicle's V2L outlet, too low wastes
+    runtime. Hence a control rather than a fixed setting.
 
     Options are discovered from the inverter (QMUCHGCR at connect) rather than
     hard-coded, because the accepted ladder varies by model and firmware. If

@@ -1,8 +1,7 @@
 """EyBond transport + Voltronic PI30 (Q-protocol) framing.
 
-Validated live against the collector dongle (PN W0824353291671) at
-10.0.0.34: UDP 58899 `set>server=` redirect -> dongle dials back on TCP
-8899 -> EyBond heartbeat (FC=1) -> Forward2Device (FC=4) wrapping classic
+Validated live against an EyBond collector dongle: UDP 58899
+`set>server=` redirect -> dongle dials back on TCP 8899 -> EyBond heartbeat (FC=1) -> Forward2Device (FC=4) wrapping classic
 `QPIGS`/`QPIRI`/`QMOD` commands -> raw `(...` responses. Device reports
 devcode 0x0102 in its heartbeat; the value placed in the FC=4 header does
 not affect relaying, so 0x0994 is used. devaddr 0xFF and 0x01 both work.

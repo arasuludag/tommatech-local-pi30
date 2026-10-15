@@ -14,7 +14,7 @@ DEFAULT_DEVADDR = 0xFF
 # SolarAssistant drives the same protocol at ~1 cmd/s, so ample margin.
 POLL_INTERVALS = {
     "QPIGS": 5,     # live status
-    "QPIGS2": 10,   # PV2 string (dual-MPPT confirmed on this unit)
+    "QPIGS2": 10,   # PV2 string (dual-MPPT units; single-MPPT reads zeros)
     "QMOD": 15,     # operating mode
     "QPIRI": 60,    # ratings + current setpoints
     "QPIWS": 30,    # warning/fault bits
@@ -25,8 +25,8 @@ POLL_INTERVALS = {
 }
 
 # Commands sent once per connection (static identity + capability discovery).
-# QMUCHGCR returns the max-utility-charging-current values this unit actually
-# accepts, so the select offers real options instead of a guessed list.
+# QMUCHGCR returns the max-utility-charging-current values the connected unit
+# actually accepts, so the select offers real options instead of a guessed list.
 STARTUP_COMMANDS = ("QID", "QVFW", "QGMN", "QMUCHGCR")
 
 # Used only when QMUCHGCR is unsupported or unparseable — the classic Voltronic
@@ -34,7 +34,7 @@ STARTUP_COMMANDS = ("QID", "QVFW", "QGMN", "QMUCHGCR")
 AC_CHARGE_CURRENT_FALLBACK = (2, 10, 20, 30, 40, 50, 60)
 
 # --- QPIGS field map: key -> index (tokens already carry decimals) ---
-# Verified live against PN W0824353291671 (PI30 / devcode 0x0102).
+# Verified live against the reference unit (PI30 / devcode 0x0102).
 QPIGS_FIELDS = {
     "grid_voltage": 0,
     "grid_frequency": 1,
@@ -135,17 +135,18 @@ QPIWS_BITS = {
 # Still shown in "Active Warnings" for context, but don't trip the Problem sensor.
 QPIWS_INFORMATIONAL = {5}
 
-# Bits this unit asserts persistently that are NOT real faults, and which we
-# drop before they reach any entity. The vendor DESS cloud reads the same raw
-# QPIWS and never reports these, and the inverter is fully functional (firmware
-# reads, QPIRI setpoint read-backs, and set commands all succeed — a genuine
-# EEPROM fault would break them). The true bit remains visible in the Problem
-# sensor's `raw_qpiws` attribute for diagnostics.
-QPIWS_SUPPRESSED = {17}  # "EEPROM fault" — chronic false positive on this PI30
+# Bits the reference unit asserts persistently that are NOT real faults, and
+# which we drop before they reach any entity. The vendor DESS cloud reads the
+# same raw QPIWS and never reports these, and the inverter is fully functional
+# (firmware reads, QPIRI setpoint read-backs, and set commands all succeed — a
+# genuine EEPROM fault would break them). The true bit remains visible in the
+# Problem sensor's `raw_qpiws` attribute for diagnostics. If your unit does not
+# assert it, empty this set so a real fault is not hidden.
+QPIWS_SUPPRESSED = {17}  # "EEPROM fault" — chronic false positive on the reference unit
 
 # --- battery analytics tunables (config entry options) ---------------
-# Defaults describe this site: 4S2P OUTDO OT200-12(GEL) = 48 V, 400 Ah.
-# See battery.py for what each one gates.
+# Defaults describe the reference bank: 48 V, 400 Ah, gel. Users set their own
+# in the options flow. See battery.py for what each one gates.
 CONF_BANK_CAPACITY_AH = "bank_capacity_ah"
 CONF_CHARGE_EFFICIENCY = "charge_efficiency"
 CONF_INVERTER_EFFICIENCY = "inverter_efficiency"

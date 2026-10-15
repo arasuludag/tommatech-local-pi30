@@ -47,14 +47,14 @@ def make_tracker(**overrides) -> BatteryTracker:
 
 
 def feed(tracker, *, seconds, voltage, charge=0.0, discharge=0.0, start=0.0,
-         step=5.0, day=DAY, pv=None, ac_out=None):
+         step=5.0, day=DAY, pv=None, ac_out=None, on_line=False):
     """Push `seconds` of samples at `step` cadence. Returns the end timestamp."""
     now = start
     end = start + seconds
     while now <= end:
         tracker.update(
             voltage=voltage, charge_current=charge, discharge_current=discharge,
-            pv_power=pv, ac_output_power=ac_out,
+            pv_power=pv, ac_output_power=ac_out, load_on_line=on_line,
             bulk_setpoint=BULK, float_setpoint=FLOAT,
             now_monotonic=now, now_local_date=day,
         )
@@ -139,6 +139,36 @@ def test_discharge_falls_back_to_ammeter_without_balance_inputs():
     assert tracker.amp_hours == 180.0
 
 
+def test_load_on_line_is_not_drained_from_the_bank():
+    """Grid, generator or V2L on the AC input: the load is not on the bank.
+
+    In Line mode the inverter passes the input straight through to the load.
+    The balance above would still charge the whole load to the battery
+    whenever the charge ammeter reads zero — 300 W of load becoming a 7 A
+    phantom drain.
+    """
+    tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
+    feed(tracker, seconds=3600, voltage=50.0, pv=0.0, ac_out=300.0, on_line=True)
+    assert tracker.amp_hours == 200.0, "the AC input carried the load, not the bank"
+    assert tracker.net_power_w == 0.0
+
+
+def test_ac_charging_on_line_counts_the_charge_ammeter():
+    """The charger is fed from the AC input; the charge ammeter still sees it."""
+    tracker = make_tracker()
+    feed(tracker, seconds=3600, voltage=50.0, charge=2.0, pv=0.0, ac_out=300.0,
+         on_line=True)
+    assert tracker.amp_hours == 201.8, "2 A at 0.9 for an hour"
+
+
+def test_ammeter_drain_still_counts_on_line():
+    """If the bank does report a drain in Line mode, it is not discarded."""
+    tracker = make_tracker()
+    feed(tracker, seconds=3600, voltage=50.0, discharge=5.0, pv=0.0, ac_out=300.0,
+         on_line=True)
+    assert tracker.amp_hours == 195.0
+
+
 def test_net_power_is_signed():
     tracker = make_tracker(inverter_efficiency=0.92, inverter_idle_w=30.0)
     feed(tracker, seconds=60, voltage=52.0, charge=40.0)
@@ -167,7 +197,7 @@ def test_stage_classification():
 
 
 def test_plateau_tolerance_covers_regulation_wander():
-    """This unit sits roughly +/-0.3 V off its setpoint."""
+    """The reference unit sits roughly +/-0.3 V off its setpoint."""
     tracker = make_tracker()
     feed(tracker, seconds=60, voltage=BULK - 0.3, charge=20.0)
     assert tracker.stage == STAGE_ABSORPTION
@@ -211,7 +241,7 @@ def test_absorption_completes_on_tail_current():
 
 
 def test_absorption_does_not_complete_below_plateau():
-    """Aug 17's failure mode: current is low but voltage never holds."""
+    """Observed failure mode: current is low but voltage never holds."""
     tracker = make_tracker()
     feed(tracker, seconds=7200, voltage=54.5, charge=5.0)
     assert tracker.absorption_complete_today is False
@@ -228,7 +258,7 @@ def test_float_transition_also_completes():
 
 
 def test_float_sag_under_load_does_not_complete():
-    """Regression, 2026-08-18 10:45.
+    """Regression.
 
     Voltage sagged through the float band for ~2.5 min during a load-driven
     oscillation while the bank was still swallowing 20 A, and the old
@@ -253,15 +283,15 @@ def test_oscillating_between_plateaus_still_completes():
 
 
 def test_brief_sag_below_both_plateaus_is_credited_back():
-    """Contract reversed 2026-08-31, and the old premise was wrong.
+    """Contract reversed, because the old premise was wrong.
 
     This used to assert that any drop off the plateau restarts the hold, on the
     reasoning that "dropping off the plateau entirely means the bank was not
-    full". The 2026-08-30 traces say otherwise: with an EV session running, the
-    bus leaves the setpoint for one to five minutes at a time all day, because
-    the car is taking what the array makes. That is a statement about the load,
-    not about the bank — and treating it as a reset is what starved
-    days_since_absorption into locking the car out. A sag shorter than
+    full". Traces say otherwise: with a large load running off surplus, the bus
+    leaves the setpoint for one to five minutes at a time all day, because the
+    load is taking what the array makes. That is a statement about the load,
+    not about the bank — and treating it as a reset starves
+    days_since_absorption and locks that same load out. A sag shorter than
     PLATEAU_BREAK_TOLERANCE_S is now credited back; a sustained one still
     resets, which test_sustained_off_plateau_still_resets_the_tail_hold covers.
     """
@@ -274,7 +304,7 @@ def test_brief_sag_below_both_plateaus_is_credited_back():
 
 
 def test_brief_spike_does_not_break_the_tail_hold():
-    """Regression, 2026-08-19.
+    """Regression.
 
     The bank sat at a 1-5 A mean for over three hours at the plateau, but brief
     spikes to 9-26 A landed in nearly every five-minute window. Requiring an
@@ -297,13 +327,13 @@ def test_sustained_rise_does_break_the_tail_hold():
 
 
 def test_bulk_ramp_through_the_float_band_is_not_float():
-    """Regression, 2026-08-30 09:18-09:31.
+    """Regression.
 
     The array is current-limited on the morning ramp, so the bank crawls up
     through the float band instead of crossing it. It sat inside for thirteen
-    minutes while accepting 21-36 A and reported Float the whole time, which is
-    a start gate for the EV charge controller. Two days earlier the same crawl
-    ran 22 minutes and did open a session, at 09:03, into a bank taking 28 A.
+    minutes while accepting 21-36 A and reported Float the whole time — and a
+    load controller that starts on Float would open a session into a bank
+    still taking 28 A.
     """
     tracker = make_tracker()
     feed(tracker, seconds=780, voltage=FLOAT, charge=30.0)
@@ -332,7 +362,7 @@ def test_established_float_survives_a_current_spike():
     Once float is established, leaving it is decided by voltage alone. If a
     load-step spike could knock the stage out, it would also yank the plateau
     out from under the absorption tail hold — which has its own, deliberately
-    longer TAIL_BREAK_TOLERANCE_S for exactly these spikes (2026-08-19).
+    longer TAIL_BREAK_TOLERANCE_S for exactly these spikes.
     """
     tracker = make_tracker(absorption_hold_s=900.0)
     now = feed(tracker, seconds=300, voltage=BULK, charge=25.0)
@@ -353,21 +383,21 @@ def test_float_alone_does_not_complete():
     assert tracker.absorption_complete_today is False
 
 
-# -- the EV lockout: absorption must survive a choppy plateau ----------
+# -- absorption must survive a choppy plateau --------------------------
 def test_brief_off_plateau_excursions_do_not_reset_the_tail_hold():
-    """Reproduces 2026-08-30 and the lockout it caused on 2026-08-31.
+    """Reproduces a lockout seen under a large surplus-driven load.
 
-    With an EV session running, the committed stage bounced off the plateau
-    every one to five minutes for six hours. Each excursion used to wipe the
-    tail hold outright, so the 15-minute latch never matured, the day ended
-    "unabsorbed" with 67 minutes at the setpoint on the clock, and two such
-    days in a row blocked EV charging on a bank at 96.5%.
+    With the load running, the committed stage bounced off the plateau every
+    one to five minutes for six hours. Each excursion used to wipe the tail
+    hold outright, so the 15-minute latch never matured, the day ended
+    "unabsorbed" with over an hour at the setpoint on the clock, and two such
+    days in a row locked the load out of a nearly full bank.
     """
     tracker = make_tracker(absorption_hold_s=900.0)
     now = feed(tracker, seconds=300, voltage=BULK, charge=25.0)
     assert tracker.stage == STAGE_ABSORPTION
 
-    # Six cycles of 150 s at tail then 60 s knocked off the plateau by the car
+    # Six cycles of 150 s at tail then 60 s knocked off the plateau by the load
     # (plus 30 s of debounce coming back) — every excursion inside
     # PLATEAU_BREAK_TOLERANCE_S. Total real plateau-at-tail time > 15 min.
     for _ in range(6):
@@ -397,15 +427,15 @@ def test_sustained_off_plateau_still_resets_the_tail_hold():
 def test_time_at_setpoint_satisfies_the_day_without_recalibrating():
     """Path two: 2 h voltage-limited is an absorption even with no tail hold.
 
-    The bank never gets near tail current here — the car is taking everything
-    the array makes — but it spent two hours pinned at the setpoint, which is
+    The bank never gets near tail current here — a large load is taking
+    everything the array makes — but it spent two hours pinned at the setpoint, which is
     what the day counter is actually asking about.
     """
     tracker = make_tracker(absorption_satisfied_s=7200.0)
     feed(tracker, seconds=7300, voltage=BULK, charge=25.0)
 
     assert tracker.absorption_complete_today is True, "the day is satisfied"
-    assert tracker.days_since_absorption == 0, "no EV lockout tomorrow"
+    assert tracker.days_since_absorption == 0, "no lockout tomorrow"
     assert tracker.calibrated is False, "time at the setpoint is not proof of full"
     assert tracker.soc_percent is not None and tracker.soc_percent < 100.0
 
@@ -456,7 +486,7 @@ def test_missed_days_counter():
 
     day = DAY + timedelta(days=3)
     feed(tracker, seconds=600, voltage=52.0, charge=30.0, start=now + 5, day=day)
-    assert tracker.days_since_absorption == 2, "two full days missed -> block EV"
+    assert tracker.days_since_absorption == 2, "two full days missed"
 
 
 def test_day_rollover_resets_daily_latches():

@@ -39,7 +39,7 @@ class TommatechLocalConfigFlow(ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_HOST, default="10.0.0.34"): str,
+                vol.Required(CONF_HOST): str,
                 vol.Optional(CONF_DEVADDR, default=DEFAULT_DEVADDR): int,
             }
         )

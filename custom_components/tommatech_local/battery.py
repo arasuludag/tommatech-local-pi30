@@ -7,8 +7,8 @@ Why this exists
 ---------------
 PI30 reports a `battery_capacity` percentage, but on a bank with no BMS the
 inverter is only inferring it from terminal voltage, and terminal voltage under
-load is dominated by IR drop (this bank is ~6.8 mOhm, so a 70 A draw moves it
-half a volt with no change in charge whatsoever). Two things need better than
+load is dominated by IR drop (the reference bank is ~6.8 mOhm, so a 70 A draw
+moves it half a volt with no change in charge whatsoever). Two things need better than
 that guess:
 
 * a state of charge trustworthy enough to reserve capacity for the night, and
@@ -17,7 +17,8 @@ that guess:
 
 Which current to believe
 ------------------------
-The two ammeters are not equally good, and it matters a great deal.
+On the reference unit the two ammeters are not equally good, and it matters a
+great deal.
 
 `battery_charge_current` is sound. Checked against the PV-minus-load energy
 balance across a full day it tracks within ~5% everywhere from 2 A to 42 A, so
@@ -48,7 +49,7 @@ not mean "the charger has finished" — only a sustained tail current does.
 The same caution applies to the stage this module reports, and did not always.
 Float was classified on voltage alone, so the long current-limited crawl up
 through the float band every morning read as Float — and Float is a surplus
-signal that the EV charge controller starts sessions on. Entering float now
+signal that a load controller may start opportunistic loads on. Entering float now
 also requires that absorption happened today and that the bank has stopped
 accepting current.
 """
@@ -86,31 +87,33 @@ IDLE_CURRENT_A = 0.5
 # never happened, so the interval is dropped instead of guessed.
 MAX_SAMPLE_GAP_S = 60.0
 
-# A stage change must persist this long before it is committed. This unit does
-# not hold its bulk setpoint tightly — it wanders roughly +/-0.3 V and
+# A stage change must persist this long before it is committed. The reference
+# unit does not hold its bulk setpoint tightly — it wanders roughly +/-0.3 V and
 # occasionally overshoots — and without debouncing, each brief excursion off
 # the plateau would reset the absorption and plateau hold timers and they would
 # never mature. Only the committed stage is exposed or acted on.
 STAGE_DEBOUNCE_S = 30.0
 
 # How long charge current may exceed the tail threshold without invalidating an
-# absorption hold. Measured 2026-08-19: the bank sat at a 1-5 A mean for over
-# three hours at the plateau, but brief spikes to 9-26 A landed in nearly every
-# five-minute window (EV modulation plus house loads). Requiring an unbroken
+# absorption hold. Measured on the reference system: the bank sat at a 1-5 A
+# mean for over three hours at the plateau, but brief spikes to 9-26 A landed in
+# nearly every five-minute window (load steps from large switching loads).
+# Requiring an unbroken
 # run reset the timer constantly and absorption never latched despite the bank
 # genuinely being at tail current. Excursions shorter than this are credited
 # back rather than treated as the bank accepting again.
 TAIL_BREAK_TOLERANCE_S = 90.0
 
 # The same idea applied to the PLATEAU test, and for the same reason one step
-# further out. Measured 2026-08-30: from the moment the EV session opened at
-# 10:23 the committed stage bounced Absorption -> Bulk -> Discharging every one
-# to five minutes for six hours, because the car takes the array's output and
-# the bus falls off the setpoint. Every one of those excursions used to wipe
-# _tail_since outright, so the 15-minute hold could never assemble and the day
-# ended "unabsorbed" with 67 minutes at the setpoint on the clock. Two such
-# days in a row block EV charging (days_since_absorption > 1), which is how the
-# car locked itself out of a bank sitting at 96.5% on 2026-08-31.
+# further out. A large load running off surplus (an EV charger, say) takes the
+# array's output, the bus falls off the setpoint, and the committed stage
+# bounces Absorption -> Bulk -> Discharging every one to five minutes; on the
+# reference system it did so for six hours straight. Every one of those
+# excursions used to wipe _tail_since outright, so the 15-minute hold could
+# never assemble and the day ended "unabsorbed" with over an hour at the
+# setpoint on the clock. Anything gating that same load on
+# days_since_absorption then locks it out of a nearly full bank: the load
+# suppresses the latch that authorises it.
 #
 # Deliberately longer than TAIL_BREAK_TOLERANCE_S: a current spike is one load
 # step, an off-plateau excursion is the array losing the setpoint, which on a
@@ -121,7 +124,11 @@ PLATEAU_BREAK_TOLERANCE_S = 180.0
 
 @dataclass
 class BatteryConfig:
-    """Tunables. Defaults describe 4S2P OUTDO OT200-12(GEL): 48 V, 400 Ah."""
+    """Tunables. Defaults describe the reference bank: 48 V, 400 Ah, gel.
+
+    Every field except absorption_satisfied_s is exposed in the options flow,
+    so another bank is configured there rather than here.
+    """
 
     capacity_ah: float = 400.0
     # Coulombic (not energy) efficiency — we count amp-hours, not watt-hours.
@@ -136,8 +143,8 @@ class BatteryConfig:
     inverter_efficiency: float = 0.92
     inverter_idle_w: float = 30.0
     # Absorption is finished when acceptance falls to this fraction of C.
-    # 0.02 = C/50 = 8 A on a 400 Ah bank, which is where the Aug 16 taper
-    # flattened out on this system, and comfortably inside the range where the
+    # 0.02 = C/50 = 8 A on a 400 Ah bank, which is where the taper flattened
+    # out on the reference system, and comfortably inside the range where the
     # charge ammeter was verified accurate.
     tail_current_fraction: float = 0.02
     # How close to a setpoint counts as sitting on that plateau. Sized for the
@@ -148,11 +155,12 @@ class BatteryConfig:
     # Second, time-based completion path, independent of the tail evidence.
     # Cumulative seconds at the absorption setpoint that count as the bank
     # having had its absorption for the day. 2 h is the textbook gel absorption
-    # period from the ~80% where this bank reaches 57.5 V, and these seconds are
-    # only accrued while the bus is genuinely voltage-limited at the setpoint —
-    # a bank being robbed by the EV drops off the plateau and stops accruing.
-    # This exists because the tail hold is evidence of a FULL bank and can be
-    # denied all day by a choppy sky or an EV session, while the day counter it
+    # period from the ~80% at which a gel bank reaches its setpoint, and these
+    # seconds are only accrued while the bus is genuinely voltage-limited at
+    # the setpoint — a bank being robbed by a large load drops off the plateau
+    # and stops accruing. This exists because the tail hold is evidence of a
+    # FULL bank and can be denied all day by a choppy sky or a large load,
+    # while the day counter it
     # feeds is supposed to answer a much weaker question: has this bank had a
     # proper absorption recently. Two hours at the setpoint answers that yes.
     absorption_satisfied_s: float = 7200.0
@@ -266,6 +274,7 @@ class BatteryTracker:
         now_local_date: date,
         pv_power: float | None = None,
         ac_output_power: float | None = None,
+        load_on_line: bool = False,
     ) -> None:
         self._roll_day(now_local_date)
 
@@ -280,7 +289,8 @@ class BatteryTracker:
             return
 
         net_a = self._net_current(
-            voltage, charge_current, discharge_current, pv_power, ac_output_power
+            voltage, charge_current, discharge_current, pv_power, ac_output_power,
+            load_on_line,
         )
         self._net_power_w = round(net_a * voltage, 1)
 
@@ -307,6 +317,7 @@ class BatteryTracker:
         discharge_current: float,
         pv_power: float | None,
         ac_output_power: float | None,
+        load_on_line: bool,
     ) -> float:
         """Signed battery current in amps: positive in, negative out.
 
@@ -319,7 +330,14 @@ class BatteryTracker:
             return charge_current * self.config.charge_efficiency
 
         balance_a = 0.0
-        if pv_power is not None and ac_output_power is not None:
+        # The balance assumes the bank is what feeds the load. In Line mode it
+        # is not: the inverter passes its AC input (grid, generator, or a
+        # vehicle's V2L outlet) straight through to the load, and that input
+        # also powers the inverter itself. Reconstructing from it would book
+        # the whole load against the bank — a phantom 5-7 A drain at an ordinary evening
+        # load, every sample the charger happens to be idle. Only the ammeter
+        # is left, and with the bank genuinely idle its low reading is honest.
+        if not load_on_line and pv_power is not None and ac_output_power is not None:
             deficit_w = (
                 ac_output_power / self.config.inverter_efficiency
                 + self.config.inverter_idle_w
@@ -351,12 +369,11 @@ class BatteryTracker:
         # Float is a band, but voltage alone cannot identify it. This code used
         # to assume a bulk ramp "passes through in seconds, so STAGE_DEBOUNCE_S
         # discards the transit". It does not. The array is current-limited
-        # during the morning ramp, so the bank CRAWLS through the band:
-        # measured 2026-08-30 it sat inside from 09:18 to 09:31 — thirteen
-        # minutes — while accepting 21-36 A, and reported Float throughout. On
-        # 2026-08-28 the same crawl lasted 22 minutes, and the EV controller,
-        # which starts a session on stage Absorption or Float, opened one at
-        # 09:03 into a bank still swallowing 28 A at 86.6% SOC.
+        # during the morning ramp, so the bank CRAWLS through the band: on the
+        # reference system it sat inside for thirteen to twenty-two minutes
+        # while accepting 21-36 A, and reported Float throughout — long enough
+        # for a controller that starts loads on Absorption or Float to open
+        # one into a bank still swallowing 28 A.
         #
         # Entry therefore tests the two things that actually separate a float
         # from a ramp, neither of which is voltage: absorption must have
@@ -414,7 +431,7 @@ class BatteryTracker:
         # tail logic below: enough cumulative time at the setpoint IS an
         # absorption, whether or not acceptance was ever observed to fall to
         # the tail. This is the path that keeps days_since_absorption honest on
-        # days when the EV or the sky denies the tail hold. It deliberately
+        # days when a large load or the sky denies the tail hold. It deliberately
         # does NOT re-zero the SOC counter — 2 h of voltage-limited charging
         # says the bank had its absorption, not that it reached 100%.
         if (
@@ -433,10 +450,10 @@ class BatteryTracker:
         # float before the taper at bulk has flattened — but BOTH paths require
         # acceptance to have actually fallen to the tail.
         #
-        # Voltage alone proves nothing here. This unit oscillates between its
-        # float and bulk setpoints under load, and a sag passing through the
-        # float band was enough to latch a false completion at 10:45 on
-        # 2026-08-18 while the bank was still taking 20 A. Current is the only
+        # Voltage alone proves nothing here. The reference unit oscillates
+        # between its float and bulk setpoints under load, and a sag passing
+        # through the float band was enough to latch a false completion while
+        # the bank was still taking 20 A. Current is the only
         # honest signal that a bank is full; the plateau just says which
         # regulation point it is sitting on.
         at_plateau = self._stage == STAGE_ABSORPTION or (
@@ -446,8 +463,8 @@ class BatteryTracker:
             # Tolerated and credited back exactly like a current excursion,
             # on the longer PLATEAU_BREAK_TOLERANCE_S. The old code reset here
             # unconditionally, so one Bulk or Discharging sample threw away
-            # however many minutes of hold had accumulated — and under an EV
-            # session that sample arrives every one to five minutes, so the
+            # however many minutes of hold had accumulated — and under a large
+            # load that sample arrives every one to five minutes, so the
             # hold never matured. See the constant.
             self._note_hold_break(now_monotonic, PLATEAU_BREAK_TOLERANCE_S)
             return
@@ -469,8 +486,8 @@ class BatteryTracker:
     def _note_hold_break(self, now_monotonic: float, tolerance: float) -> None:
         """One excursion tracker, two tolerances.
 
-        Deliberately a single field rather than one per break kind. An EV
-        session produces excursions that begin as a current rise and continue
+        Deliberately a single field rather than one per break kind. A large
+        load produces excursions that begin as a current rise and continue
         as an off-plateau drop, and with a tracker per kind both credited the
         same wall-clock seconds back to the hold — pushing _tail_since forward
         faster than time passed, so the latch could never mature. The tolerance
@@ -486,11 +503,11 @@ class BatteryTracker:
     def _mark_absorption_satisfied(self, reason: str) -> None:
         """The bank has had its absorption today — day counter only.
 
-        Split out from _mark_absorption_complete on 2026-08-31. The two facts
-        were latched together and they are not the same claim: "this bank has
-        been properly recharged recently" (what days_since_absorption reports,
-        and what gates EV charging) is much weaker than "the counter can be
-        trusted to read 100% right now".
+        Kept apart from _mark_absorption_complete on purpose. The two facts
+        were once latched together and they are not the same claim: "this bank
+        has been properly recharged recently" (what days_since_absorption
+        reports, and what a load controller would gate on) is much weaker than
+        "the counter can be trusted to read 100% right now".
         """
         self._absorption_done_today = True
         self._days_since_absorption = 0

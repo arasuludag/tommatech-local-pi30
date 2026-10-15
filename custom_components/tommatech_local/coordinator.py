@@ -354,6 +354,10 @@ class InverterCoordinator:
             discharge_current=gs.get("battery_discharge_current"),
             pv_power=pv_power,
             ac_output_power=gs.get("ac_output_active_power"),
+            # QMOD rather than grid voltage: with SBU priority the input can be
+            # present while the bank still carries the load (mode B). QMOD
+            # polls at 15 s, so a transition can mis-file one or two samples.
+            load_on_line=self.data.get("MODE") == "L",
             bulk_setpoint=piri.get("battery_bulk_voltage"),
             float_setpoint=piri.get("battery_float_voltage"),
             now_monotonic=time.monotonic(),
@@ -416,7 +420,7 @@ def _decode_warnings(bits: str) -> list[str]:
     active = []
     for idx, name in QPIWS_BITS.items():
         if idx in QPIWS_SUPPRESSED:
-            continue  # known false positive on this unit; see const.py
+            continue  # known false positive on the reference unit; see const.py
         if idx < len(bits) and bits[idx] == "1":
             active.append(name)
     return active

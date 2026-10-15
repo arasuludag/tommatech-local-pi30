@@ -56,8 +56,9 @@ class InverterOnline(InverterEntity, BinarySensorEntity):
 class InverterFault(InverterEntity, BinarySensorEntity):
     """On when any non-informational warning/fault bit is set.
 
-    'Line fail' is excluded — this site is off-grid, so absent AC input is
-    the permanent normal condition, not a fault.
+    'Line fail' is excluded — on an off-grid site absent AC input is the
+    permanent normal condition, not a fault. Grid-tied sites should watch
+    operating mode or grid voltage for outages instead.
     """
 
     _attr_name = "Problem"
