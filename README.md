@@ -42,9 +42,10 @@ A bank with no BMS gets no trustworthy SOC from the inverter — PI30's
 `battery_capacity` is inferred from terminal voltage, and terminal voltage
 under load is dominated by IR drop. `battery.py` derives better numbers by
 integrating the charge/discharge current the inverter *does* report accurately,
-then re-zeroing that integral once a day at the one moment the true state is
-known for free: the end of absorption, when the bank is full by definition.
-Drift therefore never has to survive longer than one solar cycle.
+then re-zeroing that integral at the one moment the true state is known for
+free: the end of absorption, when the bank is full by definition. That bounds
+drift to one solar cycle only on days that reach it. See **Drift between
+re-zeros** for the days that don't.
 
 ### Which ammeter is believed
 
@@ -84,7 +85,7 @@ the inverter claims. Compare it against `battery_net_power` to see the gap.
 
 | Entity | What it means |
 | --- | --- |
-| `sensor.*_battery_soc_counted` | Coulomb-counted SOC. The `calibrated` attribute is `false` until the first absorption re-zero — before that it is an integral started from the inverter's guess. |
+| `sensor.*_battery_soc_counted` | Coulomb-counted SOC. Reads 100 % only after a re-zero today (see **Drift between re-zeros**). The `calibrated` attribute is `false` until the first absorption re-zero — before that it is an integral started from the inverter's guess — and never resets afterwards. `last_calibrated` is the date of the most recent re-zero, `overshoot_ah` the charge refused at the 99 % ceiling since then, and `last_calibration_error_ah` how far the counter had drifted when last re-zeroed (positive = it had been reading high). |
 | `sensor.*_battery_net_power` | Signed battery power actually being integrated (+ in, - out), with discharge reconstructed as above. |
 | `sensor.*_battery_charge_stage` | Bulk / Absorption / Float / Discharging / Idle, classified from voltage against the live setpoints plus current direction. |
 | `binary_sensor.*_absorption_complete_today` | The bank has had its absorption today, by either path below. Latches until local midnight. |
@@ -121,6 +122,31 @@ Tunables live in the integration's **Configure** dialog (bank capacity, charge
 efficiency, tail-current fraction, plateau tolerance, hold times) and apply
 live without dropping the collector session. Defaults describe the reference
 bank (48 V, 400 Ah lead-acid gel), so set at least the capacity to match yours.
+
+### Drift between re-zeros
+
+Short or overcast days and charging cut off early (a generator stopped while
+the bank still takes a heavy current, say) never reach the tail. With no
+re-zero, the counter's error compounds. On the reference system it grew by a
+few points a day, always optimistic, for six days in a row, until the counter
+read 83 % on a bank at roughly half charge. Gel makes this easy to miss:
+it reaches the absorption setpoint well before it is full, so neither the
+voltage nor the counter looks wrong while it happens.
+
+Two things keep that visible:
+
+- **The counter stops at 99 % until tail current proves the bank full that
+  day.** An integral that reaches capacity by itself proves only its own
+  arithmetic, and a bare 100 % looked exactly like a finished charge.
+- **Charge refused at that ceiling is kept** (`overshoot_ah`). At the next
+  re-zero the bank holds exactly its capacity, so the counter's contents plus
+  the refused charge, minus capacity, is how far it had drifted. That figure is
+  published as `last_calibration_error_ah`. It is the measurement to trim
+  `charge_efficiency`, `inverter_efficiency` and `inverter_idle_w` against,
+  instead of guessing from overnight voltage.
+
+Until a re-zero has happened recently (`last_calibrated`), treat the counter as
+an estimate that is probably high.
 
 State survives restarts via HA's storage helper; the first sample after a
 restart is deliberately not integrated, so downtime can't invent charge.

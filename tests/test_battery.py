@@ -101,10 +101,80 @@ def test_long_gap_is_not_integrated():
 def test_soc_clamps_at_both_ends():
     tracker = make_tracker()
     feed(tracker, seconds=36000, voltage=52.0, charge=60.0)
-    assert tracker.soc_percent == 100.0
+    assert tracker.soc_percent == 99.0, "no re-zero today, so 100% is out of reach"
     tracker2 = make_tracker()
     feed(tracker2, seconds=36000, voltage=48.0, discharge=60.0)
     assert tracker2.soc_percent == 0.0
+
+
+# -- the uncalibrated ceiling -------------------------------------------
+def test_integral_alone_stops_short_of_full_and_keeps_the_rest():
+    """Seen live: the counter hit 100% with 13-22 A still going in."""
+    tracker = make_tracker()          # 200 Ah
+    # 40 A for 10 h at 0.9 = 360 Ah booked; only 196 Ah of it fits under 99%.
+    feed(tracker, seconds=36000, voltage=52.0, charge=40.0)
+    assert tracker.soc_percent == 99.0
+    assert abs(tracker.overshoot_ah - (360.0 - 196.0)) < 0.5
+
+
+def test_rezero_reports_how_far_the_counter_had_drifted():
+    tracker = make_tracker()
+    # 40 A for 6 h at 0.9 = 216 Ah on top of 200: 196 fits under 99%, 20 refused.
+    end = feed(tracker, seconds=21600, voltage=52.0, charge=40.0)
+    assert tracker.soc_percent == 99.0
+    assert abs(tracker.overshoot_ah - 20.0) < 0.05
+    # An hour at the setpoint still taking 30 A (27 Ah booked), then the tail.
+    end = feed(tracker, seconds=3600, voltage=BULK, charge=30.0, start=end + 5)
+    end = feed(tracker, seconds=1000, voltage=BULK, charge=6.0, start=end + 5)
+    assert tracker.calibrated is True
+    assert tracker.soc_percent == 100.0
+    assert tracker.last_calibrated == DAY
+    assert tracker.overshoot_ah == 0.0, "spent on the measurement"
+    # Booked in total: 200 + 216 + 27 + ~1.4 during the 15 min tail hold =
+    # 444.4 Ah, against a bank that turned out to hold 400.
+    error = tracker.last_calibration_error_ah
+    assert error is not None and abs(error - 44.4) < 0.3, error
+
+
+def test_rezero_from_below_reports_a_negative_error():
+    tracker = make_tracker()          # 200 Ah, and the bank turns out full
+    feed(tracker, seconds=1000, voltage=BULK, charge=6.0)
+    assert tracker.calibrated is True
+    error = tracker.last_calibration_error_ah
+    assert error is not None and -200.0 < error < -197.0, error
+
+
+def test_after_the_rezero_the_counter_may_sit_at_full():
+    tracker = make_tracker()
+    end = feed(tracker, seconds=1000, voltage=BULK, charge=6.0)
+    feed(tracker, seconds=3600, voltage=FLOAT, charge=5.0, start=end + 5)
+    assert tracker.soc_percent == 100.0
+    assert tracker.overshoot_ah == 0.0, "float on a proven-full bank is not drift"
+
+
+def test_ceiling_never_pulls_yesterdays_full_down():
+    """A float-maintained bank sits at 100% across midnight; that is not drift."""
+    tracker = make_tracker()
+    end = feed(tracker, seconds=1000, voltage=BULK, charge=6.0)
+    assert tracker.soc_percent == 100.0
+    end = feed(tracker, seconds=600, voltage=FLOAT, charge=2.0, start=end + 5,
+               day=DAY + timedelta(days=1))
+    assert tracker.soc_percent == 100.0
+    assert tracker.overshoot_ah == 0.0, "never drained, so still proven full"
+    # Once it has drained, coming back up without a re-zero is drift again.
+    end = feed(tracker, seconds=3600, voltage=49.0, discharge=20.0, start=end + 5,
+               day=DAY + timedelta(days=1))
+    feed(tracker, seconds=7200, voltage=52.0, charge=20.0, start=end + 5,
+         day=DAY + timedelta(days=1))
+    assert tracker.soc_percent == 99.0
+    assert tracker.overshoot_ah > 10.0
+
+
+def test_discharge_below_the_ceiling_is_unaffected():
+    tracker = make_tracker()
+    feed(tracker, seconds=36000, voltage=52.0, charge=60.0)
+    feed(tracker, seconds=3600, voltage=49.0, discharge=10.0, start=36005)
+    assert tracker.amp_hours == 386.0, "396 Ah at the ceiling, minus 10 Ah"
 
 
 # -- discharge reconstruction ------------------------------------------
@@ -517,6 +587,30 @@ def test_restore_round_trip():
     assert restored.absorption_complete_today is True
     assert restored.calibrated is True
     assert restored.needs_seed is False
+    assert restored.last_calibrated == DAY
+    assert restored.last_calibration_error_ah == tracker.last_calibration_error_ah
+
+
+def test_pending_overshoot_survives_a_restart():
+    tracker = make_tracker()
+    feed(tracker, seconds=36000, voltage=52.0, charge=40.0)
+    restored = BatteryTracker(BatteryConfig(capacity_ah=400.0))
+    restored.restore(tracker.as_dict())
+    assert restored.overshoot_ah == tracker.overshoot_ah > 0
+
+
+def test_restore_of_state_from_before_the_ceiling():
+    tracker = make_tracker()
+    feed(tracker, seconds=1000, voltage=BULK, charge=6.0)
+    stored = tracker.as_dict()
+    for key in ("overshoot_ah", "last_calibrated", "last_calibration_error_ah"):
+        del stored[key]
+    revived = BatteryTracker(BatteryConfig(capacity_ah=400.0))
+    revived.restore(stored)
+    assert revived.overshoot_ah == 0.0
+    assert revived.last_calibrated is None
+    assert revived.last_calibration_error_ah is None
+    assert revived.calibrated is True
 
 
 def test_restore_does_not_integrate_across_downtime():

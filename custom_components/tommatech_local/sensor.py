@@ -241,13 +241,19 @@ class BatterySocSensor(InverterSensor):
 
     `calibrated` matters: until the first absorption completes, this is an
     integral started from the inverter's guess, so it inherits that error.
+    `last_calibrated` matters more once it has: every day since then is a day
+    the counter has run without a check.
     """
 
     @property
     def extra_state_attributes(self):
         battery = self.coordinator.battery
+        last = battery.last_calibrated
         return {
             "calibrated": battery.calibrated,
+            "last_calibrated": last.isoformat() if last else None,
+            "last_calibration_error_ah": battery.last_calibration_error_ah,
+            "overshoot_ah": battery.overshoot_ah,
             "amp_hours": battery.amp_hours,
             "capacity_ah": battery.config.capacity_ah,
             "charge_efficiency": battery.config.charge_efficiency,

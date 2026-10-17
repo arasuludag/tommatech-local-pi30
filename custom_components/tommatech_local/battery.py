@@ -37,9 +37,15 @@ for conversion efficiency and the inverter's own idle draw, minus whatever PV
 is contributing. Where the two disagree the larger drain wins, because
 underestimating the drain is the dangerous direction.
 
-Drift is bounded regardless: the integral is re-zeroed to 100% once a day at
-the end of absorption, when the bank is full by definition, so no error has to
-survive longer than one solar cycle.
+Drift is bounded only on days that earn a re-zero: the integral is reset to
+100% at the end of absorption, when the bank is full by definition. A run of
+short or overcast days, or a generator run stopped while the bank is still
+accepting heavily, never reaches that point, and the error compounds. On the
+reference system it compounded by a few points a day, always optimistic, for
+six days running, until the counter read 83% on a half-empty bank. So between
+re-zeros the counter does two things. It never reads 100% without one
+(UNCALIBRATED_CEILING). And it keeps the charge it refused at that ceiling, so
+the next re-zero measures how far it had drifted instead of hiding it.
 
 That re-zero is therefore the one moment that must not be wrong, and it is
 gated on charge current rather than voltage. This inverter swings between its
@@ -121,6 +127,25 @@ TAIL_BREAK_TOLERANCE_S = 90.0
 # back, never counted, so the hold still measures real at-plateau seconds.
 PLATEAU_BREAK_TOLERANCE_S = 180.0
 
+# The highest fraction of capacity the counter may read before tail current
+# has proven the bank full today. An integral that reaches capacity on its own
+# proves only its own arithmetic. On the reference system it reached 100% with
+# 13-22 A still going in at the absorption setpoint, and on a dashboard that
+# looked exactly like a finished charge. 100% is therefore reserved for the
+# re-zero. Charge refused above the ceiling is not thrown away: it accumulates
+# in _overshoot_ah until the next re-zero turns it into a measured error.
+UNCALIBRATED_CEILING = 0.99
+
+
+def _parse_date(value: Any) -> date | None:
+    """A stored ISO date, or None when absent or unreadable."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
+
 
 @dataclass
 class BatteryConfig:
@@ -197,6 +222,9 @@ class BatteryTracker:
         self._saw_absorption_today = False
         self._absorption_seconds_today = 0.0
         self._days_since_absorption: int | None = None
+        self._overshoot_ah = 0.0
+        self._last_calibrated: date | None = None
+        self._last_calibration_error_ah: float | None = None
 
     # -- configuration -------------------------------------------------
     def configure(self, config: BatteryConfig) -> None:
@@ -205,6 +233,8 @@ class BatteryTracker:
         if self._ah is not None and config.capacity_ah != self.config.capacity_ah:
             fraction = self._ah / self.config.capacity_ah
             self._ah = fraction * config.capacity_ah
+            # Same scaling, so a pending overshoot keeps its share of the bank.
+            self._overshoot_ah *= config.capacity_ah / self.config.capacity_ah
         self.config = config
 
     # -- persistence ---------------------------------------------------
@@ -218,6 +248,11 @@ class BatteryTracker:
             "saw_absorption_today": self._saw_absorption_today,
             "absorption_seconds_today": round(self._absorption_seconds_today),
             "days_since_absorption": self._days_since_absorption,
+            "overshoot_ah": self._overshoot_ah,
+            "last_calibrated": (
+                self._last_calibrated.isoformat() if self._last_calibrated else None
+            ),
+            "last_calibration_error_ah": self._last_calibration_error_ah,
         }
 
     def restore(self, stored: dict[str, Any] | None) -> None:
@@ -230,12 +265,7 @@ class BatteryTracker:
             return
         self._ah = stored.get("amp_hours")
         self._calibrated = bool(stored.get("calibrated", False))
-        stored_date = stored.get("date")
-        if stored_date:
-            try:
-                self._today = date.fromisoformat(stored_date)
-            except ValueError:
-                self._today = None
+        self._today = _parse_date(stored.get("date"))
         self._absorption_done_today = bool(stored.get("absorption_done_today", False))
         # Absent in state written before the satisfied/recalibrated split: fall
         # back to the old flag, which used to mean both things at once.
@@ -245,6 +275,10 @@ class BatteryTracker:
         self._saw_absorption_today = bool(stored.get("saw_absorption_today", False))
         self._absorption_seconds_today = float(stored.get("absorption_seconds_today", 0) or 0)
         self._days_since_absorption = stored.get("days_since_absorption")
+        # Absent in state written before the uncalibrated ceiling existed.
+        self._overshoot_ah = float(stored.get("overshoot_ah", 0) or 0)
+        self._last_calibrated = _parse_date(stored.get("last_calibrated"))
+        self._last_calibration_error_ah = stored.get("last_calibration_error_ah")
 
     @property
     def needs_seed(self) -> bool:
@@ -260,6 +294,7 @@ class BatteryTracker:
         pct = max(0.0, min(100.0, float(percent)))
         self._ah = self.config.capacity_ah * pct / 100.0
         self._calibrated = False
+        self._overshoot_ah = 0.0
 
     # -- ingest --------------------------------------------------------
     def update(
@@ -421,9 +456,23 @@ class BatteryTracker:
     def _integrate(self, net_a: float, interval: float) -> None:
         if self._ah is None:
             return
-        self._ah = max(
-            0.0, min(self.config.capacity_ah, self._ah + net_a * interval / 3600.0)
+        capacity = self.config.capacity_ah
+        ceiling = (
+            capacity if self._recalibrated_today else capacity * UNCALIBRATED_CEILING
         )
+        ah = self._ah + net_a * interval / 3600.0
+        if net_a > 0 and ah > ceiling:
+            # Refused, never pulled down: a counter that yesterday's re-zero
+            # left at 100% stays there until the bank actually drains.
+            kept = min(capacity, max(self._ah, ceiling))
+            # A bank proven full — re-zeroed today, or still sitting at capacity
+            # because it has not drained since — takes float and recombination
+            # current, not stored charge, and the old clamp was right for that.
+            # Anywhere else the refusal IS the drift.
+            if not self._recalibrated_today and self._ah < capacity:
+                self._overshoot_ah += ah - kept
+            ah = kept
+        self._ah = max(0.0, ah)
 
     def _check_absorption_complete(self, charge_current: float, now_monotonic: float) -> None:
         cfg = self.config
@@ -516,12 +565,28 @@ class BatteryTracker:
         _LOGGER.info("Absorption satisfied for today (%s)", reason)
 
     def _mark_absorption_complete(self, reason: str) -> None:
-        """Tail-current evidence: the bank is full, so also re-zero the counter."""
+        """Tail-current evidence: the bank is full, so also re-zero the counter.
+
+        The one moment the counter's error is known exactly: the bank holds
+        capacity right now, so what the counter held, plus what it refused at
+        the ceiling, minus capacity, is how far it drifted since the last
+        re-zero (or since the seed). Positive means it had been reading high.
+        """
         self._mark_absorption_satisfied(reason)
+        capacity = self.config.capacity_ah
+        self._last_calibration_error_ah = (
+            None if self._ah is None
+            else round(self._ah + self._overshoot_ah - capacity, 1)
+        )
+        self._overshoot_ah = 0.0
+        self._last_calibrated = self._today
         self._recalibrated_today = True
-        self._ah = self.config.capacity_ah
+        self._ah = capacity
         self._calibrated = True
-        _LOGGER.info("Absorption complete (%s); SOC counter re-zeroed to 100%%", reason)
+        _LOGGER.info(
+            "Absorption complete (%s); SOC counter re-zeroed to 100%% "
+            "(it had drifted %s Ah)", reason, self._last_calibration_error_ah,
+        )
 
     def _roll_day(self, today: date) -> None:
         if self._today == today:
@@ -565,8 +630,31 @@ class BatteryTracker:
 
     @property
     def calibrated(self) -> bool:
-        """False while the counter is still running from a seeded guess."""
+        """False while the counter is still running from a seeded guess.
+
+        Never resets once true, so it says nothing about how recent the last
+        re-zero was — that is last_calibrated.
+        """
         return self._calibrated
+
+    @property
+    def last_calibrated(self) -> date | None:
+        """Local date of the last tail-current re-zero; None if none recorded."""
+        return self._last_calibrated
+
+    @property
+    def last_calibration_error_ah(self) -> float | None:
+        """How far the counter had drifted at the last re-zero; + = read high."""
+        return self._last_calibration_error_ah
+
+    @property
+    def overshoot_ah(self) -> float:
+        """Charge refused at UNCALIBRATED_CEILING since the last re-zero.
+
+        Growing while the bank still accepts real current means the counter
+        reached the top before the bank did.
+        """
+        return round(self._overshoot_ah, 1)
 
     @property
     def stage(self) -> str:
