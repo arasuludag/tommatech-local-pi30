@@ -78,10 +78,40 @@ def test_charge_integration_applies_efficiency():
 
 
 def test_charge_uses_the_ammeter_not_the_balance():
-    """Charge current is verified accurate, so an absurd balance is ignored."""
-    tracker = make_tracker()
+    """An absurd balance is ignored; the charge reading is what counts."""
+    tracker = make_tracker(inverter_idle_w=52.0)
     feed(tracker, seconds=3600, voltage=52.0, charge=40.0, pv=0.0, ac_out=5000.0)
-    assert tracker.amp_hours == 236.0
+    # 40 A less the inverter's own 1 A, at 0.9.
+    assert tracker.amp_hours == 235.1
+
+
+def test_charge_reading_is_net_of_the_inverters_own_draw():
+    """On the reference unit PV minus load minus this reading closed to within
+    a few tens of watts at every power level, which no real inverter manages:
+    the reading is derived from PV and load, and still contains whatever the
+    inverter itself consumes. 10 A at 50 V with a 50 W draw is 9 A into the bank.
+    """
+    tracker = make_tracker(inverter_idle_w=50.0)
+    feed(tracker, seconds=3600, voltage=50.0, charge=10.0, pv=600.0, ac_out=100.0)
+    assert tracker.amp_hours == 208.1
+
+
+def test_charge_below_the_inverters_own_draw_counts_as_nothing():
+    """Not as a drain. PI30 reports whole amps, so 1 A is noise either way,
+    and booking it as a drain would bleed a floating bank the charger is
+    holding up."""
+    tracker = make_tracker(inverter_idle_w=55.0)
+    feed(tracker, seconds=3600, voltage=FLOAT, charge=1.0, pv=150.0, ac_out=100.0)
+    assert tracker.amp_hours == 200.0
+    assert tracker.net_power_w == 0.0
+
+
+def test_tail_test_reads_the_raw_charge_current():
+    """The tail threshold was set against the raw reading. Correcting it too
+    would latch "full" about an amp earlier, on a less full bank."""
+    tracker = make_tracker(inverter_idle_w=55.0)
+    feed(tracker, seconds=1200, voltage=BULK, charge=8.5, pv=700.0, ac_out=200.0)
+    assert tracker.absorption_complete_today is False
 
 
 def test_long_gap_is_not_integrated():
@@ -224,8 +254,12 @@ def test_load_on_line_is_not_drained_from_the_bank():
 
 
 def test_ac_charging_on_line_counts_the_charge_ammeter():
-    """The charger is fed from the AC input; the charge ammeter still sees it."""
-    tracker = make_tracker()
+    """The charger is fed from the AC input; the charge ammeter still sees it.
+
+    So does the inverter's own draw, which is why none of it is taken off
+    the charge reading here.
+    """
+    tracker = make_tracker(inverter_idle_w=50.0)
     feed(tracker, seconds=3600, voltage=50.0, charge=2.0, pv=0.0, ac_out=300.0,
          on_line=True)
     assert tracker.amp_hours == 201.8, "2 A at 0.9 for an hour"

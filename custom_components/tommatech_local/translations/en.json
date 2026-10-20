@@ -37,7 +37,7 @@
           "absorption_hold_min": "How long the tail current must hold before the SOC counter re-zeroes to 100%.",
           "pinned_hold_min": "How long a plateau must hold before 'Battery Voltage Pinned' turns on.",
           "inverter_efficiency": "Used to reconstruct discharge from the load, because PI30 discharge ammeters can under-read badly (the reference unit reads zero below ~120 W).",
-          "inverter_idle_w": "The inverter's own housekeeping draw, added on top of the load. Trim both of these by watching overnight SOC drift against the morning re-zero."
+          "inverter_idle_w": "The inverter's own housekeeping draw. Added on top of the load at night, and taken off the charge reading by day, because on the reference unit that reading is derived from PV and load. Trim both of these against last_calibration_error_ah on the counted SOC."
         }
       }
     }

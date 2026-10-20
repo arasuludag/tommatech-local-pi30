@@ -20,9 +20,13 @@ Which current to believe
 On the reference unit the two ammeters are not equally good, and it matters a
 great deal.
 
-`battery_charge_current` is sound. Checked against the PV-minus-load energy
-balance across a full day it tracks within ~5% everywhere from 2 A to 42 A, so
-it is used directly, and the absorption tail test can rely on it.
+`battery_charge_current` is usable but not net. It agrees with PV minus load
+to within a few tens of watts at every power level, which is too close: the
+inverter's own draw has to come from somewhere, so the reading is derived from
+PV and load rather than measured at the bank, and over-reads by whatever the
+inverter itself consumes. The configured idle draw is taken off it before it
+is integrated. The absorption tail test still reads it raw, because that is
+the scale its threshold was set on.
 
 `battery_discharge_current` is not usable. Measured overnight, when PV is zero
 and the bank must therefore supply the entire load plus conversion losses, it
@@ -161,10 +165,10 @@ class BatteryConfig:
     # absorption absorbs whatever this gets wrong.
     charge_efficiency: float = 0.90
     # DC->AC conversion efficiency and the inverter's own housekeeping draw,
-    # used to reconstruct discharge from the load. Both are deliberately
+    # used to reconstruct discharge from the load. The idle draw is also taken
+    # off the charge reading, which includes it. Both are deliberately
     # adjustable: they are the only fitted parameters in the counter, and the
-    # honest way to trim them is to watch overnight drift against the morning
-    # re-zero.
+    # honest way to trim them is last_calibration_error_ah at each re-zero.
     inverter_efficiency: float = 0.92
     inverter_idle_w: float = 30.0
     # Absorption is finished when acceptance falls to this fraction of C.
@@ -361,18 +365,40 @@ class BatteryTracker:
         """
         if voltage <= 0:
             return 0.0
-        if charge_current > IDLE_CURRENT_A:
-            return charge_current * self.config.charge_efficiency
-
-        balance_a = 0.0
         # The balance assumes the bank is what feeds the load. In Line mode it
         # is not: the inverter passes its AC input (grid, generator, or a
         # vehicle's V2L outlet) straight through to the load, and that input
         # also powers the inverter itself. Reconstructing from it would book
         # the whole load against the bank — a phantom 5-7 A drain at an ordinary evening
-        # load, every sample the charger happens to be idle. Only the ammeter
-        # is left, and with the bank genuinely idle its low reading is honest.
-        if not load_on_line and pv_power is not None and ac_output_power is not None:
+        # load, every sample the charger happens to be idle — and would take
+        # the inverter's draw off a charge it never came out of. Only the
+        # ammeters are left, and with the bank genuinely idle their low
+        # readings are honest.
+        use_balance = (
+            not load_on_line and pv_power is not None and ac_output_power is not None
+        )
+        if charge_current > IDLE_CURRENT_A:
+            # The charge reading is not measured at the bank either. On the
+            # reference unit PV minus load minus this reading closed to within
+            # a few tens of watts at every power level, from dawn to a 3.4 kW
+            # load at noon, which leaves nothing for the inverter's own
+            # consumption: the reading is derived from PV and load, and books
+            # that consumption as charge. At 0.9 that ran the counter ~13 Ah
+            # high per sunny day. The idle draw comes off here. MPPT and
+            # conversion losses do not, because nothing pins them down at high
+            # power; last_calibration_error_ah measures what remains.
+            #
+            # Floored at zero rather than turned into a drain: PI30 reports
+            # whole amps, so a reading this small is noise either way, and at a
+            # plateau the charger is holding the bank up.
+            if use_balance:
+                charge_current = max(
+                    0.0, charge_current - self.config.inverter_idle_w / voltage
+                )
+            return charge_current * self.config.charge_efficiency
+
+        balance_a = 0.0
+        if use_balance:
             deficit_w = (
                 ac_output_power / self.config.inverter_efficiency
                 + self.config.inverter_idle_w

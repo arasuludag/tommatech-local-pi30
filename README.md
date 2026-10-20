@@ -53,9 +53,21 @@ On the reference unit (see **Notes**) the two current readings are not equally
 trustworthy, which changes what the counter integrates. Other PI30 units may
 behave differently; check yours the same way before trusting either.
 
-**Charge current is sound.** Checked against the PV-minus-load energy balance
-over a full day it tracks within ~5% from 2 A to 42 A, so it is used directly
-and the absorption tail test relies on it.
+**Charge current is usable, but not net.** On the reference unit, PV minus load
+minus the charge reading closes to within a few tens of watts at every power
+level, from dawn to a 3.4 kW load at noon. No inverter runs on nothing, so the
+reading must be derived from PV and load rather than measured at the bank, and
+it includes the inverter's own consumption. Booked as stored charge, that ran
+the counter about 13 Ah high per sunny day (measured by
+`last_calibration_error_ah`). So while PV and load readings are available, the
+counter integrates
+
+    battery_in = (charge_current - inverter_idle_w / battery_voltage) * charge_efficiency
+
+MPPT and conversion losses are not subtracted, because nothing pins them down
+at high power; expect a smaller residual drift, still optimistic. The
+absorption tail test keeps the raw reading, because its threshold was set
+against it.
 
 **Discharge current is not usable.** Measured overnight, when PV is zero and
 the bank must supply the entire load plus conversion losses, it reported 192 W
@@ -71,14 +83,15 @@ So discharge is reconstructed from the energy balance instead:
 
 Where the reconstruction and the ammeter disagree, the larger drain wins —
 underestimating the drain is the dangerous direction. `inverter_efficiency` and
-`inverter_idle_w` are the only fitted parameters in the counter; trim them by
-watching overnight drift against the morning re-zero.
+`inverter_idle_w` are the only fitted parameters in the counter; trim them
+against `last_calibration_error_ah` at each re-zero.
 
 The one exception is **Line mode** (QMOD `L`): with the grid, a generator or a
 vehicle's V2L outlet on the AC input, the inverter passes that input straight
 through to the load, so the balance describes the AC source rather than the
 bank. There the reconstruction is skipped and only the ammeters count; AC
-charging still shows up on the charge ammeter like PV charging does.
+charging still shows up on the charge ammeter like PV charging does, and
+nothing is taken off it, because the AC input powers the inverter too.
 
 The stock `battery_discharge_power` sensor is left untouched — it reports what
 the inverter claims. Compare it against `battery_net_power` to see the gap.
@@ -160,8 +173,15 @@ different PI30 unit:
   DHCP list will have it). The dongle must be able to reach Home Assistant on
   TCP 8899, and Home Assistant must reach the dongle on UDP 58899.
 - Set the bank capacity under **Configure** and review the other tunables.
-  Trim `inverter_efficiency` and `inverter_idle_w` by watching overnight drift
-  against the morning re-zero.
+  Trim `inverter_efficiency` and `inverter_idle_w` against
+  `last_calibration_error_ah` at each re-zero.
+- Check your charge reading the same way before relying on it: average PV
+  minus AC output minus battery charge power over an hour of steady charging.
+  A residual near zero means the reading is derived from PV and load, as on the
+  reference unit, and the counter corrects for it. A residual of roughly your
+  idle draw plus a few percent of throughput means yours is measured at the
+  bank; the counter will then read low by about the idle draw over each
+  charging day, and `last_calibration_error_ah` will come out negative.
 - `QPIWS_SUPPRESSED` in `const.py` drops one warning bit (EEPROM fault) that
   the reference unit asserts permanently. If yours doesn't, remove it so a real
   fault is not hidden.
